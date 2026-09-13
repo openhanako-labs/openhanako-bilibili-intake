@@ -89,6 +89,13 @@ bilibili_video_intake({ source: "BV...", background: true })
 → 立刻返回 taskId，完成后结果自动回到对话
 ```
 
+## 贡献者
+
+| 贡献者 | 角色 |
+|---|---|
+| [Yuexiye](https://github.com/Yuexiye) | 主要维护者，v2 迁移与全部功能开发 |
+| [OpenHanako](https://github.com/openhanako-labs) | 项目托管与发布 |
+
 ## 自检
 
 ```sh
