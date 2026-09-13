@@ -1,0 +1,397 @@
+/**
+ * http/intake.js — 内容摄取页面的后端 API
+ *
+ * v2 差异：
+ *   - 文件从 routes/ 改坐 http/：v2 把顶级 routes/ 目录当成另一种路由来源，
+ *     与 ctx.routes.register() **互斥**，两边同时存在整个应用装载时直接 failed。
+ *   - 路径前缀去掉 /api/intake/...，改成 /intake/...，因为 ctx.routes.register
+ *     已经把自己挂在 /api/apps/<appId>/routes/ 下面。
+ *   - 页面本身不再由这里渲染：v2 把 ui/ 静态树挂在 /api/apps/<id>/ui<route>，
+ *     卡片直接指向 ui/intake.html。
+ *
+ * ⭐ v0.6.4：统一 Python 运行时。
+ *   本文件过去是 v1 的 routes/intake.js 原样搬来的，7 处 `execFileSync("python", …)`
+ *   走的是**系统 Python**，而模型工具走的是**共享 venv** —— 同一个 App 里两个解释器，
+ *   health 报 cuda 12.8/true、工具报 cpu，互相矛盾。
+ *   现在全部改走 lib/runtime.js 的 runCollectorArgs()，与模型工具同源。
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { getSettings } from "../lib/settings.js";
+import { prepareRuntime, runCollector, runCollectorArgs } from "../lib/runtime.js";
+
+/**
+ * runtime 解析结果的短缓存。
+ *
+ * 为什么需要：prepareRuntime 每次都会起 python 探一次 torch（`import torch`，实测秒级），
+ * 若每个 HTTP 请求都走一遍，页面每点一下都要白等。runtime 的形态（用哪个 venv、
+ * 哪个模式）在一次进程生命周期内是稳定的，缓存住即可。
+ *
+ * 失效方式：TTL 到期，或调用方显式 invalidate（改设置后）。
+ */
+const RUNTIME_TTL_MS = 60_000;
+let runtimeCache = null;
+
+// ⭐ v0.6.17：health 会起 Python 探 torch，实测冷启动 5.9s / 命中 runtime 缓存后仍 3.4s
+//（health 这个 action 自己就在探）。卡片点「状态」tab 才调它，不该每次白等。
+const HEALTH_TTL_MS = 120_000;
+let healthCache = null;
+let cookiesCache = null;
+const COOKIES_TTL_MS = 60_000;
+
+async function runtimeFor(ctx) {
+  const now = Date.now();
+  if (runtimeCache && now - runtimeCache.at < RUNTIME_TTL_MS) {
+    return runtimeCache.runtime;
+  }
+  const settings = await getSettings(ctx);
+  const runtime = await prepareRuntime(ctx, settings);
+  runtimeCache = { at: now, runtime };
+  return runtime;
+}
+
+/** 供设置保存等场景主动失效（下一请求重新解析）。 */
+export function invalidateRuntimeCache() {
+  runtimeCache = null;
+  healthCache = null;
+  cookiesCache = null;
+}
+
+/** 跑一次 collector，返回解析后的 JSON；失败时抛出带 stderr 的错误。 */
+async function runJson(ctx, args, { label, timeoutMs, inputPaths } = {}) {
+  const runtime = await runtimeFor(ctx);
+  const { stdout } = await runCollectorArgs(runtime, args, { label, timeoutMs, inputPaths });
+  return JSON.parse(String(stdout).trim());
+}
+
+/**
+ * ⭐ v0.6.10：页面端采集改走 canonical 的 runCollector(payload)。
+ *
+ * 以前 fetch / search 两条路由自己拼 args，漏了三样关键参数：
+ *   1. --cookies-file（settings.cookiesFile）——B 站字幕/音频要登录态，
+ *      不带就等于匿名采集，B 站直接不给字幕；
+ *   2. --with-comments + --comment-limit——cli.py 里是 store_true，
+ *      不传就是 0 条评论，容易被误判成「cookies 没生效」；
+ *   3. --no-audio——音频 CDN 连不上时会抛异常炸掉整个进程。
+ * 改走 runCollector 后，whisper 模型/设备/字幕语言/audioFormat 也自动带上，
+ * 与模型工具同一套行为，不会再出现「卡片结果和工具结果不一致」。
+ */
+async function runPayload(ctx, payload, { timeoutMs } = {}) {
+  const runtime = await runtimeFor(ctx);
+  return runCollector(runtime, payload, { timeoutMs });
+}
+
+/** 把异常统一成页面能读的形状（v1 时代也是这个约定：{ ok:false, error }）。 */
+function fail(c, e) {
+  const detail = e?.details?.stderr ? `：${String(e.details.stderr).trim().slice(0, 300)}` : "";
+  return c.json({ ok: false, error: `${e?.message || String(e)}${detail}` });
+}
+
+export default function (app, ctx) {
+  const dataDir = ctx.dataDir || path.join(ctx.pluginDir, ".data");
+
+  // ── API: 健康诊断 ──
+  // 带 TTL 缓存；?refresh=1 强制重探。卡片前端读 cached 字段决定是否显示「x 分钟前」。
+  app.get("/intake/health", async (c) => {
+    try {
+      const force = c.req.query("refresh") === "1";
+      const now = Date.now();
+      if (!force && healthCache && now - healthCache.at < HEALTH_TTL_MS) {
+        return c.json({ ...healthCache.body, _cached: true, _cachedAt: healthCache.at });
+      }
+      const body = await runJson(ctx, ["--action", "health"], { label: "health", timeoutMs: 60_000 });
+      healthCache = { at: now, body };
+      return c.json({ ...body, _cached: false });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 路由状态 ──
+  app.get("/intake/routing", async (c) => {
+    try {
+      return c.json(await runJson(ctx, ["--action", "routing-status"], { label: "routing", timeoutMs: 30_000 }));
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 采集 ──
+  //
+  // ⭐ 边界说明：卡片路由是**同步短请求**，宿主对 app 路由有 30s 封顶（实测，
+  // 超了直接 HTTP 500 `Internal Server Error`，不走本文件的 fail()）。
+  // 所以这里默认 noAudio=true：只做 metadata + 字幕 + 评论，实测 4-6s。
+  // 音频下载 + Whisper 转写是长任务，走模型工具 bilibili_video_intake
+  // 的 background 通道，那里没有 30s 限制。不要在这里默默接受 noAudio:false
+  // ——那样调用方只会看到一个看不懂的 500。
+  app.post("/intake/fetch", async (c) => {
+    try {
+      const body = await c.req.json();
+      const { source, platform, mode } = body;
+      if (!source) return c.json({ ok: false, error: "需要 source" }, 400);
+      if (body.noAudio === false) {
+        return c.json({
+          ok: false,
+          error: "卡片接口不支持音频下载 + Whisper 转写：宿主对 app 路由有 30s 封顶，"
+            + "音频路径经常超时。请用模型工具 bilibili_video_intake（传 background:true），"
+            + "那里走后台通道，没有 30s 限制。",
+        }, 400);
+      }
+      const outputDir = path.join(dataDir, "captures", `p_${Date.now()}`);
+      const result = await runPayload(ctx, {
+        source,
+        platform,
+        mode,
+        outputDir,
+        // 默认带评论（与工具端一致），可显式关闭。
+        withComments: body.withComments !== false,
+        // ⭐ withSubComments 也要转发。漏了的话卡片侧关不掉二级评论，
+        // 而工具侧可以——两边行为不一致。
+        withSubComments: body.withSubComments !== false,
+        commentLimit: Number(body.commentLimit) > 0 ? Number(body.commentLimit) : 50,
+        noAudio: true,
+        withCreator: body.withCreator === true,
+        page: Number(body.page) > 0 ? Number(body.page) : 0,
+        cookiesDir: body.cookiesDir || "",
+      }, { timeoutMs: 25_000 });
+
+      // ⭐ v0.6.16：采集完自动落一条记录（不含总结，总结由模型工具补）。
+      //   saveRecord:false 可跳过。批量模式不记录，只记单条采集。
+      if (body.saveRecord !== false && mode !== "batch" && result?.title) {
+        try {
+          const all = readRecords();
+          const rec = {
+            id: canonicalId(result.platform || platform || "bilibili", result.bvid || source),
+            platform: result.platform || platform || "bilibili",
+            source: result.bvid || source,
+            title: result.title || "",
+            author: result.author || result.uploader || "",
+            durationSec: Number(result.duration || result.durationSec) || 0,
+            summary: "",
+            tags: [result.platform || platform || ""].filter(Boolean),
+            createdAt: new Date().toISOString(),
+          };
+          const i = findRec(all, rec.id);
+          if (i >= 0) {
+            // 已有同一条：只刷新元数据，**保留手写总结**。旧 id 规范成 canonical。
+            all[i] = { ...all[i], ...rec, summary: all[i].summary || "" };
+          } else {
+            all.push(rec);
+          }
+          writeRecords(all);
+          result.savedRecordId = rec.id;
+        } catch {}
+      }
+      return c.json(result);
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 搜索 ──
+  app.get("/intake/search", async (c) => {
+    try {
+      const kw = c.req.query("keyword") || "";
+      const sort = parseInt(c.req.query("sort") || "0", 10);
+      const limit = parseInt(c.req.query("limit") || "10", 10);
+      const platform = c.req.query("platform") || "";
+      if (!kw) return c.json({ ok: false, error: "需要 keyword" }, 400);
+      const out = path.join(dataDir, "captures", `s_${Date.now()}`);
+      return c.json(await runPayload(ctx, {
+        mode: "search",
+        outputDir: out,
+        searchKeyword: kw,
+        searchSort: sort,
+        searchLimit: limit,
+        platform,
+      }, { timeoutMs: 60_000 }));
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 历史列表 ──
+  app.get("/intake/history", async (c) => {
+    try {
+      const captures = path.join(dataDir, "captures");
+      let items = [];
+      if (fs.existsSync(captures)) {
+        const dirs = fs.readdirSync(captures).filter(d => fs.statSync(path.join(captures, d)).isDirectory());
+        for (const d of dirs.slice(-50).reverse()) {
+          const resultPath = path.join(captures, d, "result.json");
+          try {
+            const data = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+            items.push({
+              id: d, title: data.title || d, platform: data.platform || "?",
+              url: data.url || "", date: data.date || d.slice(0, 10),
+              type: data.platform === "bilibili" ? "video" : "note",
+            });
+          } catch { items.push({ id: d, title: d, platform: "?", date: d.slice(0, 10), type: "unknown" }); }
+        }
+      }
+      return c.json({ ok: true, total: items.length, items });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 配置读取 ──
+  app.get("/intake/settings", async (c) => {
+    try {
+      const settingsPath = path.join(dataDir, "settings.json");
+      let settings = {};
+      if (fs.existsSync(settingsPath)) settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      return c.json({ ok: true, settings });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 配置保存 ──
+  app.post("/intake/settings", async (c) => {
+    try {
+      const body = await c.req.json();
+      fs.writeFileSync(path.join(dataDir, "settings.json"), JSON.stringify(body, null, 2), "utf-8");
+      return c.json({ ok: true });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: Cookies 状态 ──
+  // 起 Python 跑 --list-logins，实测 571ms。加 TTL 缓存，?refresh=1 强制重查。
+  app.get("/intake/cookies", async (c) => {
+    try {
+      const force = c.req.query("refresh") === "1";
+      const now = Date.now();
+      if (!force && cookiesCache && now - cookiesCache.at < COOKIES_TTL_MS) {
+        return c.json({ ...cookiesCache.body, _cached: true, _cachedAt: cookiesCache.at });
+      }
+      const cookiesDir = path.join(dataDir, "cookies");
+      const body = await runJson(ctx, [
+        "--list-logins", "--cookies-dir", cookiesDir,
+      ], { label: "cookies-list", timeoutMs: 30_000 });
+      cookiesCache = { at: now, body };
+      return c.json({ ...body, _cached: false });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: Cookies 清除 ──
+  app.post("/intake/cookies-logout", async (c) => {
+    try {
+      const body = await c.req.json();
+      await runJson(ctx, ["--logout", body.platform || "xhs"], { label: "cookies-logout", timeoutMs: 30_000 });
+      return c.json({ ok: true });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 记录（采集/总结过的内容）──
+  //
+  // ⭐ v0.6.16：卡片是**展示面**，不是抓取器。
+  //   iframe 拿不到 Bearer token（宿主把 token 放在 scoped UI 路径里，
+  //   卡片 JS 从 location.pathname 取出来放 X-Hana-App-Surface-Session 头，
+  //   这条链路已实测 200）——所以卡片能读能写，但重活（音频+Whisper）
+  //   仍然走模型工具。这里存的是「结果」：标题、作者、总结文本、标签。
+  //
+  // 三种写入方式：
+  //   1. POST /intake/fetch 带 saveRecord:true —— 采集完自动落一条元数据
+  //   2. POST /intake/record  —— 手动补/更新总结（按 id upsert）
+  //   3. 模型工具侧采集后，agent 调 POST /intake/record 补总结
+  const recordsFile = path.join(dataDir, "records.json");
+  function readRecords() {
+    try { return JSON.parse(fs.readFileSync(recordsFile, "utf-8")) || []; } catch { return []; }
+  }
+  function writeRecords(list) {
+    fs.mkdirSync(path.dirname(recordsFile), { recursive: true });
+    // ⭐ 写入前备份：防止写入中途崩溃导致数据损坏。
+    //   只保留最近一份（.bak 覆盖写），不做时间戳版本链——
+    //   记录数据量小（几百条），一份备份足够恢复。
+    try {
+      if (fs.existsSync(recordsFile)) {
+        fs.copyFileSync(recordsFile, recordsFile + ".bak");
+      }
+    } catch { /* 备份失败不阻断主流程 */ }
+    fs.writeFileSync(recordsFile, JSON.stringify(list, null, 2), "utf-8");
+  }
+
+  // ⭐ v0.6.17：canonical id。
+  //   以前 /intake/fetch 用 `rec_<bvid>`，/intake/record 用 `rec_<timestamp>_<rand>`——
+  //   同一视频两条 id 不同，upsert 对不上，卡片里点一次采集就多一条无总结的重复记录。
+  //   现在两条路径共用同一套派生规则：从 source 里提取标识（BV/AV 号优先，
+  //   否则取 URL 最后一段），拼成 `rec_<platform>_<key>`。
+  function canonicalId(platform, source) {
+    let key = String(source || "").trim();
+    const idm = key.match(/(?:BV|AV|bv|av)[0-9A-Za-z]+/);
+    if (idm) {
+      key = idm[0].toUpperCase();
+    } else if (/^https?:\/\//i.test(key)) {
+      try { key = decodeURIComponent(new URL(key).pathname.split("/").filter(Boolean).pop() || key); } catch {}
+    }
+    key = key.replace(/[^0-9A-Za-z_\-]/g, "").slice(0, 48) || "unknown";
+    return `rec_${String(platform || "bilibili").toLowerCase()}_${key}`;
+  }
+
+  // ⭐ v0.6.17：迁移期的关键。
+  //   0.6.16 及更早的记录 id 是 `rec_<timestamp>_<rand>` 或 `rec_BV1DtQABpEJH`（混合大小写），
+  //   跟新的 canonical 形式对不上——仅按存储 id 查重会让旧记录和新记录并存。
+  //   这里同时比对存储 id 和**由 source 重算的 canonical id**，命中就把旧 id 规范为新 id，
+  //   旧记录自然合并进来，不需要手动迁移脚本。
+  function findRec(all, canonId) {
+    const i = all.findIndex(r => r.id === canonId);
+    if (i >= 0) return i;
+    return all.findIndex(r => canonicalId(r.platform, r.source) === canonId);
+  }
+
+  app.get("/intake/records", (c) => {
+    try {
+      const limit = Math.max(1, Math.min(200, parseInt(c.req.query("limit") || "100", 10)));
+      const all = readRecords();
+      return c.json({ ok: true, total: all.length, items: all.slice(-limit).reverse() });
+    } catch (e) { return fail(c, e); }
+  });
+
+  app.post("/intake/record", async (c) => {
+    try {
+      const body = await c.req.json();
+      if (!body.title && !body.source) return c.json({ ok: false, error: "需要 title 或 source" }, 400);
+      const all = readRecords();
+      const rec = {
+        id: body.id || canonicalId(body.platform || "bilibili", body.source || ""),
+        platform: body.platform || "bilibili",
+        source: body.source || "",
+        title: body.title || "",
+        author: body.author || "",
+        durationSec: Number(body.durationSec) > 0 ? Number(body.durationSec) : 0,
+        summary: body.summary || "",
+        tags: Array.isArray(body.tags) ? body.tags.slice(0, 16) : [],
+        createdAt: new Date().toISOString(),
+      };
+      const i = findRec(all, rec.id);
+      if (i >= 0) {
+        // upsert：已有就合并，不覆盖空字段。旧 id 一并规范成 canonical 形式。
+        rec.createdAt = all[i].createdAt;
+        all[i] = { ...all[i], ...Object.fromEntries(Object.entries(rec).filter(([, v]) => v !== "" && v !== null)) };
+      } else {
+        all.push(rec);
+      }
+      writeRecords(all);
+      return c.json({ ok: true, record: rec });
+    } catch (e) { return fail(c, e); }
+  });
+
+  app.delete("/intake/record/:id", (c) => {
+    try {
+      const id = c.req.param("id");
+      const all = readRecords();
+      const next = all.filter(r => r.id !== id);
+      if (next.length === all.length) return c.json({ ok: false, error: "not found" }, 404);
+      writeRecords(next);
+      return c.json({ ok: true });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 日志 ──
+  app.get("/intake/logs", async (c) => {
+    try {
+      const logDir = path.join(dataDir, "logs");
+      let logs = [];
+      if (fs.existsSync(logDir)) {
+        const files = fs.readdirSync(logDir).filter(f => f.endsWith(".log")).sort().slice(-20);
+        for (const f of files) {
+          try { logs.push({ file: f, content: fs.readFileSync(path.join(logDir, f), "utf-8").slice(-2000) }); } catch {}
+        }
+      }
+      return c.json({ ok: true, logs });
+    } catch (e) { return fail(c, e); }
+  });
+}
+
+function fallbackPage(name) {
+  return `<!doctype html><html><body data-hana-theme="light" data-surface="page" style="background:#F4F3F0;color:#1E1D1C;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh"><h2>${name}</h2><p style="color:#9E9B97;font-size:13px;margin-top:8px">页面文件未加载</p></body></html>`;
+}

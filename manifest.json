@@ -1,0 +1,206 @@
+{
+  "manifestVersion": 2,
+  "id": "bilibili-intake-v2",
+  "name": "内容摄取 (Bilibili Intake)",
+  "version": "0.6.26",
+  "description": "多平台内容摄取引擎 — B站/小红书/微博/知乎/贴吧/抖音/快手。统一搜索、单视频/笔记抓取、评论、创作者主页；B站带 yt-dlp 字幕优先 + Whisper 兜底转写、音频下载、视觉帧分析。采集可丢后台，长视频不再撞 180 秒上限。v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采集过的内容带总结落盘，卡片轮询展示。v0.6.17：卡片性能（图片 1.2MB→133KB、health/cookies 加 TTL 缓存）、长总结折叠展开、记录 canonical id 修重复。v0.6.18：forceTranscribe 生效（旧逻辑被「已有字幕就跳过」短路，对有平台字幕的视频一直是死参数，batch 模式同修）。v0.6.19：transcriptSource 报告修正（旧写法看「有没有字幕文件」，force_transcribe 跑过也报 platform_subtitle；改为看 transcribe_device 是否被赋值）。v0.6.20：卡片搜索的平台选择终于生效（前端 API.search 不带 platform、后端搜索分支不读 args.platform，两头都丢；单视频模式会读，搜索模式不读，两条路径不一致）；卡片修 6 处（搜索平台、转写字段名、展开状态跨轮询、非 JSON 容错、prompt 链取消不中断、stub 平台标注）。",
+  "minAppVersion": "0.942.0",
+  "entry": "index.js",
+  "icon": "assets/icon.png",
+  "capabilities": [
+    "app/tools.expose-to-model",
+    "app/process.spawn",
+    "app/tasks.manage",
+    "app/session.start-turn"
+  ],
+  "network": {
+    "allowedHosts": [
+      "api.bilibili.com",
+      "www.bilibili.com",
+      "bilibili.com",
+      "*.bilibili.com",
+      "s.search.bilibili.com",
+      "api.vc.bilibili.com",
+      "www.xiaohongshu.com",
+      "edith.xiaohongshu.com",
+      "m.weibo.cn",
+      "weibo.com",
+      "www.zhihu.com",
+      "tieba.baidu.com",
+      "www.douyin.com",
+      "www.kuaishou.com",
+      "www.youtube.com",
+      "api.siliconflow.cn",
+      "pypi.org",
+      "files.pythonhosted.org",
+      "download.pytorch.org"
+    ],
+    "methods": [
+      "GET",
+      "POST"
+    ],
+    "allowLocalhost": false,
+    "defaultTimeoutMs": 30000,
+    "maxResponseBytes": 5242880
+  },
+  "contributes": {
+    "settings": {
+      "title": "内容摄取",
+      "schema": {
+        "properties": {
+          "runtimeMode": {
+            "type": "string",
+            "default": "auto",
+            "enum": [
+              "auto",
+              "native",
+              "wsl"
+            ],
+            "title": "Python 运行模式",
+            "description": "auto 在 Windows 上优先 native，失败再回退 WSL"
+          },
+          "nativePythonCommand": {
+            "type": "string",
+            "default": "python",
+            "title": "原生 Python 命令"
+          },
+          "wslPythonCommand": {
+            "type": "string",
+            "default": "python3",
+            "title": "WSL Python 命令"
+          },
+          "whisperModel": {
+            "type": "string",
+            "default": "base",
+            "enum": [
+              "tiny",
+              "base",
+              "small",
+              "medium",
+              "large"
+            ],
+            "title": "Whisper 模型"
+          },
+          "whisperDevice": {
+            "type": "string",
+            "default": "auto",
+            "enum": [
+              "auto",
+              "cuda",
+              "cpu"
+            ],
+            "title": "转写设备",
+            "description": "auto 优先 GPU，不可用再回退 CPU"
+          },
+          "whisperLanguage": {
+            "type": "string",
+            "default": "",
+            "title": "Whisper 语言",
+            "description": "留空自动识别"
+          },
+          "preferredSubtitleLanguages": {
+            "type": "string",
+            "default": "zh-Hans,zh-CN,zh,ai-zh,zh-TW,en,ja",
+            "title": "优先字幕语言顺序",
+            "description": "逗号分隔。有字幕时优先直连官方字幕，不走 Whisper"
+          },
+          "audioFormat": {
+            "type": "string",
+            "default": "mp3",
+            "title": "音频导出格式"
+          },
+          "cookiesFile": {
+            "type": "string",
+            "default": "",
+            "title": "cookies 文件路径",
+            "description": "可选，适用于 B站/微博/知乎公开数据"
+          },
+          "cookiesDir": {
+            "type": "string",
+            "default": "",
+            "title": "统一 cookies 存储目录",
+            "description": "设置后所有平台自动从该目录加载对应 cookies"
+          },
+          "xhsCookiesFile": {
+            "type": "string",
+            "default": "",
+            "title": "小红书专用 cookies 文件",
+            "description": "需登录态才能拿到 note 详情"
+          },
+          "enabledPlatforms": {
+            "type": "string",
+            "default": "bilibili,xhs,weibo,zhihu,tieba",
+            "title": "启用的平台",
+            "description": "逗号分隔；空 = 仅 B站"
+          },
+          "autoBootstrapPython": {
+            "type": "boolean",
+            "default": true,
+            "title": "自动创建 Python 虚拟环境",
+            "description": "首次运行自动建 venv 并安装依赖（含 torch，首次较慢）"
+          },
+          "runtimeRoot": {
+            "type": "string",
+            "default": "",
+            "title": "Python 运行时目录",
+            "description": "留空 = 自动：优先用本应用自己的，否则复用 v1 插件已建好的环境。填绝对路径则强制使用该目录（会被当作可写、可自动安装依赖）"
+          },
+          "maxReturnedTranscriptChars": {
+            "type": "number",
+            "default": 12000,
+            "title": "回传正文最大字符数"
+          },
+          "visionEnabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "启用视觉帧分析"
+          },
+          "visionBackend": {
+            "type": "string",
+            "default": "siliconflow",
+            "enum": [
+              "siliconflow",
+              "openai",
+              "qwen-local"
+            ],
+            "title": "视觉模型后端"
+          },
+          "visionSiliconflowApiKey": {
+            "type": "string",
+            "default": "",
+            "sensitive": true,
+            "title": "视觉模型 API Key"
+          },
+          "visionModel": {
+            "type": "string",
+            "default": "Qwen/Qwen3.5-397B-A17B",
+            "title": "视觉模型名称"
+          },
+          "visionFrameDetail": {
+            "type": "string",
+            "default": "balanced",
+            "enum": [
+              "efficient",
+              "balanced",
+              "token-burner"
+            ],
+            "title": "帧提取粒度"
+          }
+        }
+      }
+    },
+    "cards": [
+      {
+        "id": "intake",
+        "title": "内容摄取",
+        "description": "采集 B站/小红书/微博等平台内容，带总结落盘为记录；含搜索、健康诊断、状态诊断。卡片通过 scoped UI 路径自带凭证鉴权。",
+        "route": "/intake.html",
+        "face": {
+          "image": "face.png"
+        },
+        "cardForm": "flush",
+        "titlebar": "solid"
+      }
+    ]
+  }
+}

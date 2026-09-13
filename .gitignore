@@ -1,0 +1,5 @@
+.verify-data/
+__pycache__/
+*.pyc
+test-env/
+data/

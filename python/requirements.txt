@@ -1,0 +1,15 @@
+yt-dlp
+openai-whisper
+scrapling[fetchers]
+requests
+playwright
+curl_cffi
+msgspec
+# Multi-platform support (v0.2+)
+httpx
+parsel
+pydantic
+tenacity
+aiosqlite
+jieba
+Pillow
