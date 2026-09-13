@@ -102,3 +102,5 @@ bilibili_video_intake({ source: "BV...", background: true })
 node tests/verify-app.mjs       # mock ctx 装载 + 真起 python 的诊断
 node tests/probe-runtime.mjs    # 单独探测 runtime 解析与采集器（分步计时）
 ```
+
+<!-- HanaAgent contributor commit -->
