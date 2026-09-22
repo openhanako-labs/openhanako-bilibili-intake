@@ -19,6 +19,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { getSettings } from "../lib/settings.js";
 import { prepareRuntime, runCollector, runCollectorArgs } from "../lib/runtime.js";
+// ⭐ 2026-09-22：记录读写抽到共享实现（卡片侧与模型工具侧同一份）。
+import { backfillFromCaptures, canonicalId, listRecords, patchFromResult, readRecords, upsertRecord, writeRecords } from "../lib/records.js";
+import { writeArtifact } from "../lib/artifacts.js";
 
 /**
  * runtime 解析结果的短缓存。
@@ -151,32 +154,22 @@ export default function (app, ctx) {
         cookiesDir: body.cookiesDir || "",
       }, { timeoutMs: 25_000 });
 
+      // ⭐ P1（2026-09-22）：统一素材描述。卡片侧采集也落 artifact.json，
+      //   与模型工具侧同源 —— 否则同一个 App 里两条路径产出的"素材"形状又不一样。
+      result.artifact = writeArtifact(result, { slotDir: result.outputDir || outputDir, anchors: null });
+      if (result.artifact?.kind) result.kind = result.artifact.kind;
+
       // ⭐ v0.6.16：采集完自动落一条记录（不含总结，总结由模型工具补）。
       //   saveRecord:false 可跳过。批量模式不记录，只记单条采集。
       if (body.saveRecord !== false && mode !== "batch" && result?.title) {
         try {
-          const all = readRecords();
-          const rec = {
-            id: canonicalId(result.platform || platform || "bilibili", result.bvid || source),
-            platform: result.platform || platform || "bilibili",
-            source: result.bvid || source,
-            title: result.title || "",
-            author: result.author || result.uploader || "",
-            durationSec: Number(result.duration || result.durationSec) || 0,
-            summary: "",
-            tags: [result.platform || platform || ""].filter(Boolean),
-            createdAt: new Date().toISOString(),
-          };
-          const i = findRec(all, rec.id);
-          if (i >= 0) {
-            // 已有同一条：只刷新元数据，**保留手写总结**。旧 id 规范成 canonical。
-            all[i] = { ...all[i], ...rec, summary: all[i].summary || "" };
-          } else {
-            all.push(rec);
-          }
-          writeRecords(all);
-          result.savedRecordId = rec.id;
-        } catch {}
+          // ⭐ 2026-09-22：改用共享 upsert + patchFromResult。
+          //   以前这里自己拼一遍字段，漏掉了 result 里现成的产物与转写信息
+          //   （outputDir / transcriptTextPath / transcriptSource / subtitleFiles / reports）——
+          //   记录里看不到产物，用户只能猜"总结之后文件到底有没有留存"。
+          const { record } = upsertRecord(ctx, patchFromResult(result, { platform, source }));
+          result.savedRecordId = record.id;
+        } catch (e) { result.saveRecordError = e?.message || String(e); }
       }
       return c.json(result);
     } catch (e) { return fail(c, e); }
@@ -203,25 +196,41 @@ export default function (app, ctx) {
   });
 
   // ── API: 历史列表 ──
+  //
+  // ⭐ 2026-09-22：以前直接列 captures 下的目录，同一视频采集多次就重复好几条
+  //   （每次卡片采集开一个 p_<ts> 目录）。改按 canonical id 去重，保留最新一次，
+  //   并把槽位名 + mtime 一并返回（卡片可以拿它去调 /intake/artifact 看产物）。
   app.get("/intake/history", async (c) => {
     try {
       const captures = path.join(dataDir, "captures");
-      let items = [];
+      const items = [];
       if (fs.existsSync(captures)) {
         const dirs = fs.readdirSync(captures).filter(d => fs.statSync(path.join(captures, d)).isDirectory());
-        for (const d of dirs.slice(-50).reverse()) {
-          const resultPath = path.join(captures, d, "result.json");
+        for (const d of dirs) {
+          const full = path.join(captures, d);
+          let mtimeMs = 0;
+          try { mtimeMs = fs.statSync(full).mtimeMs; } catch { /* ignore */ }
           try {
-            const data = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+            const data = JSON.parse(fs.readFileSync(path.join(full, "result.json"), "utf-8"));
             items.push({
-              id: d, title: data.title || d, platform: data.platform || "?",
+              id: d, slot: d, title: data.title || d, platform: data.platform || "?",
               url: data.url || "", date: data.date || d.slice(0, 10),
               type: data.platform === "bilibili" ? "video" : "note",
+              artifactDir: data.outputDir || full, mtimeMs,
             });
-          } catch { items.push({ id: d, title: d, platform: "?", date: d.slice(0, 10), type: "unknown" }); }
+          } catch {
+            items.push({ id: d, slot: d, title: d, platform: "?", date: d.slice(0, 10), type: "unknown", artifactDir: full, mtimeMs });
+          }
         }
       }
-      return c.json({ ok: true, total: items.length, items });
+      const seen = new Map();
+      for (const item of items) {
+        const key = canonicalId(item.platform, item.url || item.slot);
+        const prev = seen.get(key);
+        if (!prev || (item.mtimeMs || 0) > (prev.mtimeMs || 0)) seen.set(key, item);
+      }
+      const deduped = [...seen.values()].sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0)).slice(0, 50);
+      return c.json({ ok: true, total: deduped.length, raw: items.length, items: deduped });
     } catch (e) { return fail(c, e); }
   });
 
@@ -241,6 +250,93 @@ export default function (app, ctx) {
       const body = await c.req.json();
       fs.writeFileSync(path.join(dataDir, "settings.json"), JSON.stringify(body, null, 2), "utf-8");
       return c.json({ ok: true });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 知识地图用哪个模型（复用宿主已配好的；**key 只到服务端为止**） ──
+  app.get("/intake/llm/models", async (c) => {
+    try {
+      const { describeForUi } = await import("../lib/hana-llm.js");
+      const settingsPath = path.join(dataDir, "settings.json");
+      let saved = {};
+      if (fs.existsSync(settingsPath)) saved = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      const list = await describeForUi(ctx);
+      return c.json({
+        ok: list.ok,
+        providers: list.providers,
+        current: { providerId: saved.llmProvider || "", model: saved.llmModel || "" },
+        busError: list.busError || "",
+        detail: list.detail || "",
+      });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 试一下选中的模型能不能用（真实打一次，1 token） ──
+  // ⭐ 走 python 而不是 JS fetch：① 与真实调用的 env 路径完全一致；
+  //   ② App 自己的 fetch 受 manifest 的 network.allowedHosts 限制，python 不受。
+  app.post("/intake/llm/test", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const settings = await getSettings(ctx);
+      const { resolveLlmConfig } = await import("../lib/hana-llm.js");
+      const { spawn } = await import("node:child_process");
+      const { getVenvPython } = await import("../lib/runtime.js");
+
+      const apiKey = settings.llmApiKey || "";
+      let resolved = { ok: false };
+      if (!apiKey) resolved = await resolveLlmConfig(ctx, { providerId: body?.providerId || settings.llmProvider, model: body?.model || settings.llmModel });
+      const key = apiKey || (resolved.ok ? resolved.apiKey : "");
+      const baseUrl = settings.llmBaseUrl || (resolved.ok ? resolved.baseUrl : "");
+      const model = body?.model || settings.llmModel || (resolved.ok ? resolved.model : "");
+      if (!key || !model) {
+        return c.json({ ok: false, error: resolved.error || "no_model_selected", detail: resolved.detail || "没解析到可用的 key / 模型" });
+      }
+
+      const runtime = await runtimeFor(ctx);
+      const code = [
+        "import os, json, time, httpx",
+        "t = time.time()",
+        "r = httpx.post(os.environ['OPENAI_BASE_URL'].rstrip('/') + '/chat/completions',",
+        "    headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'], 'content-type': 'application/json'},",
+        "    json={'model': os.environ['OPENAI_MODEL'], 'messages': [{'role': 'user', 'content': 'ping'}], 'max_tokens': 1},",
+        "    timeout=15)",
+        "print(json.dumps({'status': r.status_code, 'ms': int((time.time() - t) * 1000), 'body': r.text[:200]}, ensure_ascii=False))",
+      ].join("\n");
+
+      const out = await new Promise((resolve) => {
+        const child = spawn(getVenvPython(runtime), ["-c", code], {
+          windowsHide: true,
+          env: {
+            ...process.env,
+            OPENAI_API_KEY: key,
+            OPENAI_BASE_URL: baseUrl || "https://api.openai.com/v1",
+            OPENAI_MODEL: model,
+            PYTHONUTF8: "1",
+            PYTHONIOENCODING: "utf-8",
+          },
+        });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => { try { child.kill("SIGTERM"); } catch { /* 已退出 */ } }, 25000);
+        child.stdout.on("data", (ch) => { stdout += String(ch); });
+        child.stderr.on("data", (ch) => { stderr += String(ch); });
+        child.on("close", () => { clearTimeout(timer); resolve({ stdout, stderr }); });
+        child.on("error", (e) => { clearTimeout(timer); resolve({ stdout: "", stderr: e.message }); });
+      });
+
+      let parsed = null;
+      try { parsed = JSON.parse(String(out.stdout).trim().split("\n").pop()); } catch { /* 下面按失败处理 */ }
+      if (!parsed) {
+        return c.json({ ok: false, providerId: resolved.providerId || "", model, error: "python 调用失败", detail: String(out.stderr || out.stdout).trim().slice(-400) });
+      }
+      return c.json({
+        ok: parsed.status >= 200 && parsed.status < 300,
+        providerId: resolved.providerId || "(settings)",
+        model,
+        ms: parsed.ms,
+        error: parsed.status >= 200 && parsed.status < 300 ? "" : `HTTP ${parsed.status}`,
+        detail: parsed.status >= 200 && parsed.status < 300 ? "" : String(parsed.body || "").slice(0, 300),
+      });
     } catch (e) { return fail(c, e); }
   });
 
@@ -283,56 +379,20 @@ export default function (app, ctx) {
   //   1. POST /intake/fetch 带 saveRecord:true —— 采集完自动落一条元数据
   //   2. POST /intake/record  —— 手动补/更新总结（按 id upsert）
   //   3. 模型工具侧采集后，agent 调 POST /intake/record 补总结
-  const recordsFile = path.join(dataDir, "records.json");
-  function readRecords() {
-    try { return JSON.parse(fs.readFileSync(recordsFile, "utf-8")) || []; } catch { return []; }
-  }
-  function writeRecords(list) {
-    fs.mkdirSync(path.dirname(recordsFile), { recursive: true });
-    // ⭐ 写入前备份：防止写入中途崩溃导致数据损坏。
-    //   只保留最近一份（.bak 覆盖写），不做时间戳版本链——
-    //   记录数据量小（几百条），一份备份足够恢复。
-    try {
-      if (fs.existsSync(recordsFile)) {
-        fs.copyFileSync(recordsFile, recordsFile + ".bak");
-      }
-    } catch { /* 备份失败不阻断主流程 */ }
-    fs.writeFileSync(recordsFile, JSON.stringify(list, null, 2), "utf-8");
-  }
-
-  // ⭐ v0.6.17：canonical id。
-  //   以前 /intake/fetch 用 `rec_<bvid>`，/intake/record 用 `rec_<timestamp>_<rand>`——
-  //   同一视频两条 id 不同，upsert 对不上，卡片里点一次采集就多一条无总结的重复记录。
-  //   现在两条路径共用同一套派生规则：从 source 里提取标识（BV/AV 号优先，
-  //   否则取 URL 最后一段），拼成 `rec_<platform>_<key>`。
-  function canonicalId(platform, source) {
-    let key = String(source || "").trim();
-    const idm = key.match(/(?:BV|AV|bv|av)[0-9A-Za-z]+/);
-    if (idm) {
-      key = idm[0].toUpperCase();
-    } else if (/^https?:\/\//i.test(key)) {
-      try { key = decodeURIComponent(new URL(key).pathname.split("/").filter(Boolean).pop() || key); } catch {}
-    }
-    key = key.replace(/[^0-9A-Za-z_\-]/g, "").slice(0, 48) || "unknown";
-    return `rec_${String(platform || "bilibili").toLowerCase()}_${key}`;
-  }
-
-  // ⭐ v0.6.17：迁移期的关键。
-  //   0.6.16 及更早的记录 id 是 `rec_<timestamp>_<rand>` 或 `rec_BV1DtQABpEJH`（混合大小写），
-  //   跟新的 canonical 形式对不上——仅按存储 id 查重会让旧记录和新记录并存。
-  //   这里同时比对存储 id 和**由 source 重算的 canonical id**，命中就把旧 id 规范为新 id，
-  //   旧记录自然合并进来，不需要手动迁移脚本。
-  function findRec(all, canonId) {
-    const i = all.findIndex(r => r.id === canonId);
-    if (i >= 0) return i;
-    return all.findIndex(r => canonicalId(r.platform, r.source) === canonId);
-  }
+  // ⭐ 2026-09-22：记录的读写实现已抽到 lib/records.js（卡片侧与模型工具侧共用）。
+  //   这里不再自己实现 canonicalId / findRec —— 两处各写一份 = id 规则必然漂移，
+  //   而漂移的后果就是同一视频长出两条记录。
+  //   readRecords / writeRecords / upsertRecord / listRecords / patchFromResult 均从那边导入。
 
   app.get("/intake/records", (c) => {
     try {
       const limit = Math.max(1, Math.min(200, parseInt(c.req.query("limit") || "100", 10)));
-      const all = readRecords();
-      return c.json({ ok: true, total: all.length, items: all.slice(-limit).reverse() });
+      // ⭐ 2026-09-22：以前是 all.slice(-limit).reverse()（按**插入顺序**取最后 N 条）。
+      //   补写总结走的是 upsert（原地更新、createdAt 保留），所以刚补完总结的记录
+      //   既不上浮、显示时间也还是旧的 —— 卡片看起来就是"没同步"。
+      //   改按 updatedAt（缺失时退回 createdAt）倒序。
+      const { total, items } = listRecords(ctx, limit);
+      return c.json({ ok: true, total, items });
     } catch (e) { return fail(c, e); }
   });
 
@@ -340,9 +400,9 @@ export default function (app, ctx) {
     try {
       const body = await c.req.json();
       if (!body.title && !body.source) return c.json({ ok: false, error: "需要 title 或 source" }, 400);
-      const all = readRecords();
-      const rec = {
-        id: body.id || canonicalId(body.platform || "bilibili", body.source || ""),
+      // 走共享 upsert：空值不覆盖已有字段（尤其不覆盖手写总结），刷新 updatedAt。
+      const { record } = upsertRecord(ctx, {
+        id: body.id,
         platform: body.platform || "bilibili",
         source: body.source || "",
         title: body.title || "",
@@ -350,29 +410,87 @@ export default function (app, ctx) {
         durationSec: Number(body.durationSec) > 0 ? Number(body.durationSec) : 0,
         summary: body.summary || "",
         tags: Array.isArray(body.tags) ? body.tags.slice(0, 16) : [],
-        createdAt: new Date().toISOString(),
-      };
-      const i = findRec(all, rec.id);
-      if (i >= 0) {
-        // upsert：已有就合并，不覆盖空字段。旧 id 一并规范成 canonical 形式。
-        rec.createdAt = all[i].createdAt;
-        all[i] = { ...all[i], ...Object.fromEntries(Object.entries(rec).filter(([, v]) => v !== "" && v !== null)) };
-      } else {
-        all.push(rec);
-      }
-      writeRecords(all);
-      return c.json({ ok: true, record: rec });
+      });
+      return c.json({ ok: true, record });
     } catch (e) { return fail(c, e); }
   });
 
   app.delete("/intake/record/:id", (c) => {
     try {
       const id = c.req.param("id");
-      const all = readRecords();
+      const all = readRecords(ctx);
       const next = all.filter(r => r.id !== id);
       if (next.length === all.length) return c.json({ ok: false, error: "not found" }, 404);
-      writeRecords(next);
+      writeRecords(ctx, next);
       return c.json({ ok: true });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 从 captures 回填记录（2026-09-22）──
+  //
+  // 背景：0.6.26 及以前，只有卡片侧的采集会写 records.json，模型工具侧一个字都不写。
+  // 于是会出现「历史里有、记录是 0」——captures/ 里躺着一堆产物，records.json 是空的。
+  // 这个接口扫 captures/*/result.json 建记录（按 canonical id 去重，同一视频收敛成一条，
+  // 保留最新产物目录）。只补不改：已有总结的记录不会被覆盖。
+  app.post("/intake/records/backfill", (c) => {
+    try {
+      // 实现抽到 lib/records.js（App 启动时也会跑一次，见 index.js）——
+      // 两处共用一份，避免「卡片点一次」与「启动回填」两套逻辑各走各的。
+      const stats = backfillFromCaptures(ctx, path.join(dataDir, "captures"));
+      return c.json({ ok: true, ...stats });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 读回采集产物（2026-09-22）──
+  //
+  // 回答的就是那个疑虑：「总结之后文件到底有没有保留、能不能读回来」。
+  // 传记录里的 artifactDir（或 captures 下的槽位名），返回文件清单 + 正文分页。
+  // 安全边界：只允许读 <dataDir>/captures 之内的目录（防目录穿越）。
+  app.get("/intake/artifact", async (c) => {
+    try {
+      const root = path.resolve(path.join(dataDir, "captures"));
+      const slot = c.req.query("slot") || "";
+      const raw = c.req.query("dir") || "";
+      const target = path.resolve(slot ? path.join(root, slot) : raw);
+      if (target !== root && !target.startsWith(root + path.sep)) {
+        return c.json({ ok: false, error: "只允许读 captures 目录内的产物" }, 400);
+      }
+      if (!fs.existsSync(target)) return c.json({ ok: false, error: "目录不存在: " + target }, 404);
+      const files = [];
+      for (const name of fs.readdirSync(target)) {
+        try {
+          const st = fs.statSync(path.join(target, name));
+          files.push({ name, size: st.size, dir: st.isDirectory(), mtime: st.mtime.toISOString() });
+        } catch { /* 跳过不可读项 */ }
+      }
+      files.sort((a, b) => (b.size || 0) - (a.size || 0));
+      const offset = Math.max(0, parseInt(c.req.query("offset") || "0", 10));
+      const limit = Math.max(0, Math.min(20000, parseInt(c.req.query("limit") || "2000", 10)));
+      const textFile = path.join(target, "text.txt");
+      let text = null;
+      if (fs.existsSync(textFile)) {
+        const full = fs.readFileSync(textFile, "utf-8");
+        text = {
+          total: full.length,
+          offset,
+          chars: full.slice(offset, offset + limit),
+          nextOffset: offset + limit < full.length ? offset + limit : null,
+        };
+      }
+      // ⭐ P1：有 artifact.json 就一并带回（kind / anchorKind / 资源清单），
+      //   调用方不用自己猜这堆文件是什么。
+      let artifact = null;
+      const artifactFile = path.join(target, "artifact.json");
+      if (fs.existsSync(artifactFile)) {
+        try { artifact = JSON.parse(fs.readFileSync(artifactFile, "utf-8")); } catch { artifact = null; }
+      }
+      // ⭐ P2：结构化摘要与回指校验统计一并带回（summary.json 由 intake_summary 工具落盘）
+      let summary = null;
+      const summaryFile = path.join(target, "summary.json");
+      if (fs.existsSync(summaryFile)) {
+        try { summary = JSON.parse(fs.readFileSync(summaryFile, "utf-8")); } catch { summary = null; }
+      }
+      return c.json({ ok: true, dir: target, files, artifact, summary, text });
     } catch (e) { return fail(c, e); }
   });
 

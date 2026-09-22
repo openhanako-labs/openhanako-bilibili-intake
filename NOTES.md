@@ -1510,13 +1510,137 @@ BV1CXet6gE6X 日志里有 `danmaku detected: subtitle.danmaku.xml`，看起来�
 两者不能混。`_REAL_SUBTITLE_EXTS` 里 `.xml` 故意没进。
 这个视频确实没有 AI 字幕（yt-dlp 只拿到弹幕），所以走 Whisper 兜底是正确路径。
 
+## 版本变更记录（2026-09-22 从 manifest.description 迁出）
 
+> 2026-09-22：manifest 的 description 只留简介，不再堆更新内容。以下为原先写在里面的历史。
 
+原有首段：多平台内容摄取引擎 — B站/小红书/微博/知乎/贴吧/抖音/快手。统一搜索、单视频/笔记抓取、评论、创作者主页；B站带 yt-dlp 字幕优先 + Whisper 兜底转写、音频下载、视觉帧分析。采集可丢后台，长视频不再撞 180 秒上限。
 
+v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采集过的内容带总结落盘，卡片轮询展示。v0.6.17：卡片性能（图片 1.2MB→133KB、health/cookies 加 TTL 缓存）、长总结折叠展开、记录 canonical id 修重复。v0.6.18：forceTranscribe 生效（旧逻辑被「已有字幕就跳过」短路，对有平台字幕的视频一直是死参数，batch 模式同修）。v0.6.19：transcriptSource 报告修正（旧写法看「有没有字幕文件」，force_transcribe 跑过也报 platform_subtitle；改为看 transcribe_device 是否被赋值）。v0.6.20：卡片搜索的平台选择终于生效（前端 API.search 不带 platform、后端搜索分支不读 args.platform，两头都丢；单视频模式会读，搜索模式不读，两条路径不一致）；卡片修 6 处（搜索平台、转写字段名、展开状态跨轮询、非 JSON 容错、prompt 链取消不中断、stub 平台标注）。v0.6.27：总结层 P0 —— ①采集即落记录（模型工具侧过去根本不写 records.json，卡片里的“历史”只等于从卡片采过的，这就是“卡片跟历史不同步”的根因；现在卡片侧与工具侧共用 lib/records.js）；②记录改按 updatedAt 倒序（补写总结走 upsert 不上浮、时间还是旧的，改完能上浮）；③记录带上产物目录/正文字符数/字幕来源（以前 result 里都有、记录里全没，导致无法判断总结后文件到底有没有留存）；④交接处保时间锚点（长视频不再静默截断，返回 transcriptAnchors 带 truncated/nextOffset，可用 anchorOffset 分页续读）；⑤Whisper 段落级时间轴落盘（python 侧 transcribe_audio 多回一个 segments 参数，collector 写 transcript_segments.json）—— 0.6.27 之前“没平台字幕、只能靠 Whisper”的视频完全没有锚点可用；⑥新增 POST /intake/records/backfill（扫 captures 回填记录，卡片发现记录为空会自动跑一次）；⑦新增 GET /intake/artifact（按目录读回产物清单 + 正文分页，限制在 captures 内）；⑧GET /intake/history 按 canonical id 去重（同一视频重复采集不再列成一串）；⑨P1 起步：新增 lib/artifacts.js，每个槽位落 artifact.json（kind / anchorKind / text / resources）—— 总结层自此只认一种素材形状；非 B 站平台（知乎/微博/贴吧/XHS）的正文也落 text.txt 并标 textKind=article；GET /intake/artifact 一并返回 artifact.json；记录带 kind / anchorKind；⑩本地文档入口：新工具 intake_document —— txt/md/html/docx/csv/json 用标准库解析（python/doc_extract.py），PDF 需 pypdf，扫描件与 .doc/.ppt/.xls/图片指向 doc-intake 插件；产物与平台采集同构（text.txt + artifact.json + 一条记录，kind=document）。Python 侧本次共动 5 处（transcribe_audio 返回值 + segments 落盘 + 批量调用点 + 非 B 站平台文本层 + 新增 doc_extract.py），均为增量，不改变既有采集行为；⑪本地文档改为**优先直接复用环境里已装好的 doc-intake**：新增 lib/docintake.js，照拄它的 spawn 协议（python/main.py + --source/--output-dir + 一次性 stdin 传 JSON 设置 + 日志走 stderr），自动探一个能 import fitz/PIL/requests 的解释器（实测 PATH 上的 python 就能用，本地 PyMuPDF 后端无需任何凭证），产物先落 <slot>/doc-intake/ 再统一成 text.txt；它缺席/失败时自动回退到本 App 的标准库解析器。intake_document 新增 extractor（auto/builtin）与 docIntakePython 入参。
 
+---
 
+## 变更记录 v0.6.27 → v0.6.28（2026-09-22）
 
+> 按约定：manifest.description 只留简介，更新内容记在这里。
 
+### 记录层
 
+- 采集即落记录：抽 `lib/records.js` 作唯一实现，**卡片侧与模型工具侧共用**（此前工具侧一个字都不写，于是「历史里有、记录是 0」）。
+- 记录按 `updatedAt` 倒序（补写总结后能上浮），并带上产物目录 / 正文字数 / 字幕来源 / 素材类型 kind / 锚点类型 anchorKind。
+- 回填：`backfillFromCaptures()`，**App 启动时**跑一次（此前挂在卡片 tab 渲染且记录为空时，等于不跑）。按 canonical id 去重，实测三次启动幂等（扫描 22 / 新建 4 更新 18 → 之后每次 新建 0 更新 22）。
+- canonicalId 长 key 改为「可读尾段 + 短哈希」（此前直接截 48 字符，本地文档长路径会撞成同一条）。
 
+### 锚点与素材抽象
 
+- `lib/anchors.js`：把时间轴锚点从产物里读回来（`transcript_merged.json` → `transcript_segments.json` → 平台字幕文件）；返回带 `truncated`/`nextOffset` 的分页载荷，长视频不再静默截断（工具入参 `anchorOffset`/`anchorLimit`）。
+- Python：`transcribe_audio` 多回一个 `segments`，collector 落 `transcript_segments.json`（此前 Whisper 路径把时间轴拼成纯文本就丢了）。
+- `lib/artifacts.js`：每个槽位落 `artifact.json`（kind / anchorKind / text / anchors / resources），视频、笔记、文章、本地文档到此后形状一致 —— **总结层不再需要认识平台**。
+- 非 B 站平台（知乎/微博/贴吧/XHS）正文也落 `text.txt` 并标 `textKind=article`。
+
+### 本地文档
+
+- 新工具 `intake_document`：txt / md / html / docx / csv / json 走内置标准库解析器（`python/doc_extract.py`）。
+- **优先复用环境里已装好的 doc-intake**（照抄它的 spawn 协议：`main.py --source --output-dir` + 一次性 stdin 传 JSON 设置 + 日志走 stderr）；它缺席或失败自动回退内置。
+- 坑：doc-intake 对**不支持的格式**不报错，而是返回一份 `# 错误 / 所有提取后端都失败` 的 markdown —— 必须看 `metadata.usedBackend`，空就当失败回退。
+- 坑：AppHost 给子进程的 env 是**白名单**，不带 `PYTHONUTF8`；Windows 下 python stdout 会退回 cp936，中文全变 U+FFFD。修：`doc_extract.py` 自行 `sys.stdout.reconfigure(utf-8)` + JS 侧显式传 `PYTHONUTF8`/`PYTHONIOENCODING`。
+
+### P2：结构化摘要 + 可回指校验
+
+- `lib/summary.js`：摘要 = `brief` + `points[]`，每个要点必须能回指到锚点（视频=秒区间，文章/文档=小节）。出处可显式给（`at: "12:30"` / `at: "§3"`），不写就按**逐字最长公共子串**自动匹配并给分（阈值 0.5）。试过 n-gram 重叠率，会被「可以/总结」这类常用词骗过去 —— 已换掉。
+- `writeArtifact` 同时落 `anchors.json`（锚点本体；artifact.json 只存统计，回指需要段本体）。旧槽位没有这个文件时，`ensureAnchorIndex()` 从产物自身重建（正文 → 小节 / 转写 → 时间轴），不因此就判「没有锚点」。
+- 新工具 `intake_summary`（save / check / read）：落 `summary.json` + `summary.md`（保留历史版本），统计回写到记录（`summaryPoints` / `summaryGrounded` / `summaryUngrounded` / `summaryAt` / `summaryModel`）。
+- 卡片记录条多一个「要点 N · 未回指 M」标签；`GET /intake/artifact` 一并返回 `summary.json`。
+- 定位：可传记录 id，也可传 BV 号 / 链接 / 本地文件路径 / 标题片段。
+
+### 待办
+
+- P3：`knowledge_maps` 改为吃「已总结素材」，不再重读全文。
+- 评论作为可选一档「观众反响」，不混进主摘要。
+
+---
+
+## 变更记录 v0.6.28 → v0.6.29（2026-09-22）· P3：知识地图改吃已总结素材
+
+### JS 侧：`lib/materials.js`（新增）
+
+- 素材优先级：**summary（summary.json：一句话 + 带出处的要点）→ anchors（锚点段落）→ metadata（标题简介）→ full（显式要全文开头）**。
+- digest 只收**通过回指校验**的要点，并在末尾如实交代「另有 N 条未通过校验，已略去」；每条素材带 `digestSource`，地图从什么上长出来的有据可查。
+- 时间锚点同时给 `segments[{sec,text}]` —— 地图里的「跳转」要用秒。
+- 显式指定档位但拿不到时，如实降级并附注（`（请求 metadata，实际只能用 summary）`），不假装。
+
+### `generate_knowledge_map` 工具
+
+- 新入参 `recordId`（记录 id / BV 号 / 链接 / 路径）与 `materialSource`（auto|summary|anchors|metadata|full）。
+- 给了 `recordId` 就**不重复采集**，直接吃那份素材；`source` 采集完成后也会把 digest 带上（此前只往下递标题与简介）。
+- 搜索结果里若碰到以前采集过的视频，自动挂上已总结素材。
+- 返回值新增 `materialSource` 与逐条 `materials[{title,digestSource,summaryPoints}]`。
+- **修掉一个真会挂的隐患**：`execSync(args.join(" "))` 换成 `spawnSync` + 参数数组 —— 主题带空格不再是「参数被切开」，也不必担心用户输入被拼进 shell；同时带上 Python UTF-8 环境、把 stderr 原样带回来（LLM 缺 key 以前只看到一个退出码）。超时 120s → 240s。
+
+### Python 侧
+
+- `prompts.materials_for_prompt` / `pipeline._supply_prompt`：优先吃 `digest`（800 字），没有才退字幕摘录；素材多带 `kind` / `digestSource`。
+- **修 KeyError**：两处 `m["bvid"] / m["title"] / m["up"]` 是必填键 —— 文档/文章类素材没有 BV 号，一进地图就崩（`KeyError: 'bvid'`）。改为 `.get(...)`，`segments` 同样加固。
+
+### 验证
+
+- 真实数据：文档槽位 → `summary`（4/4 要点带 §出处）；视频槽位 → `anchors`（时间戳段落 200 条）；老槽位无 artifact.json 也能重建锚点索引。
+- 交接：JS 写出的 `videos.json` 经 Python `materials_for_prompt` 读回，digest / kind / digestSource / segments 都到位（无 bvid 的文档素材不再炸）。
+- 未跑：真实 LLM 生成（需要 key；App 的子进程 env 是白名单，`OPENAI_API_KEY` 是否透传待确认）。
+
+---
+
+## 变更记录 v0.6.29 → v0.6.30（2026-09-22）· LLM 链路修复
+
+跑到真实调用才发现的两件事（都是“从来没跑通过”，不是回归）：
+
+1. **去掉 `openai` 包依赖** —— 两个 venv 里都没装它（149 个包，`httpx` 在内），而 `llm_client` 顶部就 `from openai import OpenAI`。结果是 directions / map / challenge 三个模式连 import 都过不去。改成 `httpx` 直连 `/chat/completions`（与它自己的 messages 分支同款），不用装任何东西。
+2. **LLM 凭证从设置透传** —— App 给子进程的 env 是白名单，宿主里的 `OPENAI_API_KEY` 到不了 python（与当初 `PYTHONUTF8` 同一类坑）。`getSettings` 增读 `llmApiKey` / `llmBaseUrl` / `llmModel`，`generate_knowledge_map` 显式传进子进程；缺 key 时返回一句指明配置入口的人话，不再丢 traceback。
+
+> 设置入口：`app-data/bilibili-intake-v2/settings.json` 加 `llmApiKey` / `llmBaseUrl` / `llmModel`；或让宿主把 `OPENAI_API_KEY` 传进子进程环境。
+
+---
+
+## 变更记录 v0.6.30 → v0.6.31（2026-09-22）· 复用宿主的模型（用户选，key 不下发）
+
+- 新增 `lib/hana-llm.js`：`ctx.bus.request("provider:models-by-type", {type:"chat"})` 拿可用聊天模型，`provider:credentials` 拿该供应商的 `baseUrl` / `apiKey`；`provider-catalog.json` 作为“读得到就用”的兜底（按 id 过滤掉向量/图片/视频这类明显非聊天的，并在前端标明这不是权威清单）。
+- 卡片「状态 / 设置」新增**知识地图模型**区：下拉列出宿主里已配好的「供应商 · 模型」→ **保存** → **测试连通**（真打一次 1 token，15s 超时）。
+- 路由：`GET /intake/llm/models`（清单，**不含任何 key**）、`POST /intake/llm/test`。
+- `generate_knowledge_map`：自动用选中的模型（key 由宿主提供、只在服务端流转），settings 里的 `llmApiKey` / `llmBaseUrl` / `llmModel` 保留为手动覆盖（自定义端点/离线）。拿不到时返回一句指明配置入口的话。
+- 原则：**settings.json 里只存“选谁”（`llmProvider` + `llmModel`），不存 key。**
+
+---
+
+## 变更记录 v0.6.31 → v0.6.32（2026-09-22）· 声明模型能力（manifest capabilities）
+
+- **manifest 的 `capabilities` 少了两项** —— 于是「设置 → 权限管理」里根本没有“读取模型”这个开关可点，宿主也直接拒绝：
+  `not authorized to call provider:models-by-type — the user has not granted "app/models.read"`。
+  补上：`app/models.read`（列模型）+ `app/provider.credentials.read`（取该供应商的 baseUrl / apiKey）。
+- **权限面板由 manifest 驱动：声明了才出现开关，出现了才谈得上授权**（对照 hanako-mail 的 manifest 就清楚了）。
+- `POST /intake/llm/test` 改走 **python 子进程**（不再用 App 的 JS fetch）：① 与真实调用的 env 路径完全一致；② App 的 fetch 受 manifest `network.allowedHosts` 限制，python 不受。超时 25s。
+
+---
+
+## 变更记录 v0.6.32 → v0.6.33（2026-09-22）· 首次真实打通到供应商
+
+授权到手后第一次真调用：拿到了 `siliconflow` 的 baseUrl 与 key，请求发到了 `https://api.siliconflow.cn/v1/chat/completions` —— 然后被 **400** 挡回来。
+
+原因：自动选模选了 `BAAI/bge-m3`，**那是个向量模型**，拿去 chat/completions 当然不合法。两处修复：
+
+1. **过滤明显不是聊天的模型**（`embed` / `bge` / `rerank` / `image` / `video` / `audio` / `tts` / `vision-ocr`）—— 清单与默认选择都跳过。
+2. **llm_client 报错带上响应体** —— `raise_for_status()` 只留一句 “400 Bad Request”，而真正原因（模型不存在 / 不支持 `response_format` / 参数不合法）在 body 里。顺带：`complete_json` 的“去掉 response_format 重试”判据看的是错误文本，带上 body 才能触发。
+
+---
+
+## 变更记录 v0.6.33 → v0.6.34（2026-09-22）· 知识地图丢掉后台（真跑通了）
+
+**先跑通了**：素材=那份 4/4 回指校验通过的摘要，模型=日日新 `sensenova-6.8-flash-lite`，真生成出一张地图（**4 个阶段 / 约 6 小时**）：
+`W:/Games/Hanako/Work/output/知识地图/2026-09-22-视频总结-app--总结层与记录同步-总结层加固-map.md`
+地图里的四个 clip 就是摘要里的四条要点 —— **素材确实来自“已总结素材”，而不是标题**。
+
+**但跑了 52.9 秒。** 而宿主给工具调用的 RPC 上限是 **30 秒** —— 同步等就必然被掐断（`RPC callback.tools.execute timed out after 30000ms`）。所以：
+
+- `generate_knowledge_map` 新增 `background`（**默认 true**）：走 `lib/tasks.js` 的 `submitBackground`，立刻返回 taskId，完成后结果自己回到对话（同 `intake_document`）。这是刚需，不是优化。
+- `lib/tasks.js`：`submitBackground` 支持 `deps.startText`，让不同工具能说自己的开场句（之前不管是采集还是生地图一律说“已在后台开始采集”）。
+- 错误改成**抛异常**统一处理：前台 → `toToolError`，后台 → `tasks.fail`（信息不再半路丢掉）。
+- `pipeline.map_to_markdown`：文档/文章素材没有时间轴，剪片段不再渲染 `` `@?` ``（看着像坏掉的跳转）。

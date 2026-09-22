@@ -46,6 +46,9 @@ const API = {
   health:  () => req("GET", "/intake/health"),
   routing: () => req("GET", "/intake/routing"),
   records: () => req("GET", "/intake/records?limit=100"),
+  // ⭐ 2026-09-22：历史里有、记录是 0 时自动回填一次；产物读回也走这里。
+  backfill: () => req("POST", "/intake/records/backfill"),
+  artifact: (dir) => req("GET", "/intake/artifact?dir=" + encodeURIComponent(dir)),
   saveRec: (d) => req("POST", "/intake/record", d),
   delRec:  (id) => req("DELETE", "/intake/record/" + encodeURIComponent(id)),
   search:  (kw, sort, limit, platform) => req("GET", `/intake/search?keyword=${encodeURIComponent(kw)}&sort=${sort||0}&limit=${limit||10}${platform ? "&platform=" + encodeURIComponent(platform) : ""}`),
@@ -56,6 +59,9 @@ const API = {
   history: () => req("GET", "/intake/history"),
   logs:    () => req("GET", "/intake/logs"),
   settings:{ get: () => req("GET", "/intake/settings"), set: (d) => req("POST", "/intake/settings", d) },
+  // ⭐ 知识地图模型：清单来自宿主（复用已配好的供应商），key 不下发
+  llmModels: () => req("GET", "/intake/llm/models"),
+  llmTest: (d) => req("POST", "/intake/llm/test", d),
 };
 
 // ── 小工具 ──
@@ -102,6 +108,8 @@ let pollTimer = null;
 // ⭐ 展开状态跨轮询保留。旧写法每次轮询重建 innerHTML，
 //   `clamped` + `data-open="0"` 会把已展开的总结收回去——用户展开一次、15 秒后被收。
 const openSums = new Set();
+// ⭐ 2026-09-22：回填只试一次（记录为空时）。
+let backfillTried = false;
 
 // ── 鉴权状态 ──
 function setAuthStatus() {
@@ -143,7 +151,18 @@ async function renderRecords() {
   if (!wrap.dataset.loaded) {
     wrap.innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>加载中…</div></div>';
   }
-  const r = await API.records();
+  let r = await API.records();
+  // ⭐ 2026-09-22：0.6.26 及以前只有卡片侧采集会写 records.json，模型工具侧一个字不写，
+  //   于是会出现「历史里有、记录是 0」。这里自愈一次：发现记录为空就从 captures 回填。
+  //   每次打开卡片最多试一次（backfillTried），不会反复扫目录。
+  if (!backfillTried && r.ok && (r.total || 0) === 0) {
+    backfillTried = true;
+    const bf = await API.backfill();
+    if (bf.ok && (bf.created || bf.updated)) {
+      r = await API.records();
+      flash("#rec-status", `已从历史回填 ${bf.created} 条记录（扫描 ${bf.scanned} 个产物目录）`, false);
+    }
+  }
   const count = $("#rec-count");
   if (count) count.textContent = (r.total || 0);
 
@@ -174,11 +193,16 @@ async function renderRecords() {
         ${rec.author ? '<span>' + esc(rec.author) + "</span>" : ""}
         ${rec.durationSec ? '<span>' + fmtDur(rec.durationSec) + "</span>" : ""}
         <span class="rec-plat">${esc(platName(rec.platform))}</span>
-        <span class="rec-when">${fmtAgo(rec.createdAt)}</span>
+        ${rec.kind ? '<span class="tag" title="素材类型（artifact.json 的 kind）">' + esc({ video: "视频", article: "文章", document: "文档" }[rec.kind] || rec.kind) + "</span>" : ""}
+        <span class="tag" title="${sm ? "已回写总结" : "采集到了但还没写总结；用模型工具写完后回写这条记录"}">${sm ? "已总结" : "未总结"}</span>
+        ${rec.transcriptChars ? '<span title="采集到的正文字符数">' + rec.transcriptChars + " 字</span>" : ""}
+        ${rec.summaryPoints ? '<span class="tag" title="结构化摘要：要点数与回指校验结果（回指不到 = 可能编的）">要点 ' + rec.summaryPoints + (rec.summaryUngrounded ? " · 未回指 " + rec.summaryUngrounded : " · 已全部回指") + "</span>" : ""}
+        <span class="rec-when" title="最近更新">${fmtAgo(rec.updatedAt || rec.createdAt)}</span>
       </div>
       ${summary}
       ${tags ? '<div class="rec-tags">' + tags + "</div>" : ""}
       ${rec.source ? '<div class="rec-src">' + esc(rec.source) + "</div>" : ""}
+      ${rec.artifactDir ? '<div class="rec-src" title="采集产物目录：正文 text.txt、原始字幕、报告、帧图都在这里；不采集就不会删">产物：' + esc(rec.artifactDir) + "</div>" : ""}
     </div>`;
   }).join("");
 
@@ -413,11 +437,77 @@ async function renderStatus() {
       <div class="st-head">设置</div>
       ${setRows.map(([k, v]) => '<div class="st-line"><span class="st-k">' + esc(k) + '</span><span class="st-v">' + esc(v) + "</span></div>").join("")}
     </div>
+    <div class="st-block" id="llm-block"><div class="st-head">知识地图模型</div><div class="empty"><div>加载中…</div></div></div>
     <div class="st-block">
       <div class="st-head">鉴权</div>
       <div class="st-line"><span class="st-k">凭证</span><span class="st-v">${SS ? "surface session" : "缺失（离线）"}</span></div>
       <div class="st-line"><span class="st-k">路由</span><span class="st-v">${ROUTE_BASE}</span></div>
     </div>`;
+
+  // ⭐ 知识地图模型选择器（单独异步加载，不堵住状态区）
+  loadLlmBlock(s);
+}
+
+/**
+ * 知识地图模型：从宿主读已配好的供应商/模型，让用户选一个。
+ * key 全程只在服务端；这里只存"选谁"（llmProvider + llmModel）。
+ */
+async function loadLlmBlock(currentSettings) {
+  const el = $("#llm-block");
+  if (!el) return;
+  let data = null;
+  try { data = await API.llmModels(); } catch (e) { data = { ok: false, busError: e?.message || String(e) }; }
+  if (!$("#llm-block")) return; // 已经切走了
+  const cur = (data && data.current) || {};
+  const providers = (data && data.providers) || [];
+  if (!providers.length) {
+    el.innerHTML = '<div class="st-head">知识地图模型</div>'
+      + '<div class="st-line"><span class="st-k">宿主模型</span><span class="st-v warn">读不到</span></div>'
+      + '<div class="st-sub">' + esc(data?.busError || data?.detail || "宿主未返回模型列表") + '</div>'
+      + '<div class="st-sub">知识地图需要 LLM。也可以在 settings.json 里手填 llmApiKey / llmBaseUrl / llmModel。</div>';
+    return;
+  }
+  const options = [];
+  for (const p of providers) for (const m of (p.models || [])) options.push({ pid: p.id, model: m });
+  const optHtml = options.map(o => {
+    const sel = (o.pid === cur.providerId && o.model === cur.model) ? " selected" : "";
+    return '<option value="' + esc(o.pid + "|" + o.model) + '"' + sel + ">" + esc(o.pid + " · " + o.model) + "</option>";
+  }).join("");
+  el.innerHTML = '<div class="st-head">知识地图模型<span class="st-cached">复用宿主，key 不下发</span></div>'
+    + '<div class="st-line"><span class="st-k">可选项</span><span class="st-v">' + providers.length + ' 个供应商 / ' + options.length + ' 个模型</span></div>'
+    + (data?.fallback ? '<div class="st-sub">宿主模型列表读不到，以下来自 provider-catalog.json 兜底（可能含非聊天模型）</div>' : '')
+    + '<div class="st-line"><span class="st-k">选用</span><span class="st-v"><select id="llm-pick" style="max-width:260px">' + optHtml + '</select></span></div>'
+    + '<div class="st-line"><span class="st-k">操作</span><span class="st-v"><button id="llm-save" type="button">保存</button> <button id="llm-test" type="button">测试连通</button> <span id="llm-out"></span></span></div>';
+
+  const picked = () => {
+    const v = ($("#llm-pick") || {}).value || "";
+    const i = v.indexOf("|");
+    return i < 0 ? { providerId: v, model: "" } : { providerId: v.slice(0, i), model: v.slice(i + 1) };
+  };
+  const out = (text, warn) => {
+    const el2 = $("#llm-out");
+    if (el2) el2.innerHTML = '<span class="' + (warn ? "warn" : "ok") + '">' + esc(text) + "</span>";
+  };
+
+  const saveBtn = $("#llm-save");
+  if (saveBtn) saveBtn.onclick = async () => {
+    const { providerId, model } = picked();
+    try {
+      out("保存中…");
+      await API.settings.set({ ...(currentSettings || {}), llmProvider: providerId, llmModel: model });
+      out("已保存：知识地图将用 " + model);
+    } catch (e) { out("保存失败：" + (e?.message || e), true); }
+  };
+  const testBtn = $("#llm-test");
+  if (testBtn) testBtn.onclick = async () => {
+    const { providerId, model } = picked();
+    try {
+      out("测试中…");
+      const r = await API.llmTest({ providerId, model });
+      if (r && r.ok) out("连通正常（" + (r.ms || "?") + "ms）");
+      else out("不可用：" + (r?.error || "未知") + (r?.detail ? " · " + String(r.detail).slice(0, 80) : ""), true);
+    } catch (e) { out("测试失败：" + (e?.message || e), true); }
+  };
 }
 
 // ⭐ 历史 tab：显示采集记录（后端 /intake/history）

@@ -89,6 +89,16 @@ export const parameters = {
       type: "number",
       description: "可选覆盖回传给 Agent 的最大正文字符数。",
     },
+    // ⭐ v0.6.27：长视频不再静默截断。锚点可用时返回带时间轴的正文，
+    //   本次没给完的部分用 anchorOffset 续读。
+    anchorOffset: {
+      type: "number",
+      description: "可选：从第几段字幕开始回传（0 起，默认 0）。上一次返回里 transcriptAnchors.nextOffset 就是续读值。",
+    },
+    anchorLimit: {
+      type: "number",
+      description: "可选：本次最多回传多少段带时间轴的字幕，默认 400。",
+    },
     cookiesDir: {
       type: "string",
       description: "统一 cookies 存储目录路径（可选）。如果提供，collector 会自动从该目录加载对应平台的 cookies。",

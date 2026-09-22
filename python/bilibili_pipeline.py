@@ -320,8 +320,13 @@ def download_subtitles(source: str, output_dir: Path, subtitle_languages: list[s
 # ── Whisper transcription ──
 
 
-def transcribe_audio(audio_path: Path, model_name: str, language: str, device_preference: str) -> tuple[str, str]:
-    """Transcribe audio using Whisper. Returns (text, device_used).
+def transcribe_audio(audio_path: Path, model_name: str, language: str, device_preference: str) -> tuple[str, str, list]:
+    """Transcribe audio using Whisper. Returns (text, device_used, segments)。
+
+    ⭐ v0.6.27：把段落一起还回去。以前只回 `"".join(seg.text)` 的纯文本，
+    段落级时间轴（start/end）在函数内部就被丢掉了 —— 上层拿不到锚点，
+    长视频只能整段截断喂给模型。segments 形如
+    [{"start": 0.0, "end": 2.4, "text": "..."}]，由调用方落盘。
     
     ⭐ v0.6.24：优先用 faster-whisper（CTranslate2 后端，速度 4x），
     没装则回退到 openai-whisper。两者 API 不同：
@@ -335,7 +340,7 @@ def transcribe_audio(audio_path: Path, model_name: str, language: str, device_pr
         return _transcribe_openai_whisper(audio_path, model_name, language, device_preference)
 
 
-def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str, device_preference: str, WhisperModel) -> tuple[str, str]:
+def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str, device_preference: str, WhisperModel) -> tuple[str, str, list]:
     """faster-whisper 实现：CTranslate2 后端，速度 4x。"""
     device = resolve_whisper_device(device_preference)
     model_ref = resolve_whisper_model_reference(model_name)
@@ -354,11 +359,22 @@ def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str,
     segments, info = model.transcribe(str(audio_path), **opts)
     
     # faster-whisper 返回迭代器，需要拼接
-    text = "".join(seg.text for seg in segments)
-    return text.strip(), device
+    # ⭐ v0.6.27：拼接的同时把段落留住（时间轴是锚点，不在这里丢掉）
+    parts: list[str] = []
+    seg_out: list[dict[str, Any]] = []
+    for seg in segments:
+        piece = (seg.text or "").strip()
+        if piece:
+            parts.append(piece)
+        seg_out.append({
+            "start": round(float(seg.start or 0.0), 3),
+            "end": round(float(seg.end or 0.0), 3),
+            "text": piece,
+        })
+    return "".join(parts).strip(), device, seg_out
 
 
-def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str, device_preference: str) -> tuple[str, str]:
+def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str, device_preference: str) -> tuple[str, str, list]:
     """openai-whisper 实现（回退路径）。"""
     import whisper
     
@@ -372,7 +388,16 @@ def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str,
     
     result = model.transcribe(str(audio_path), **opts)
     text = result.get("text", "").strip()
-    return text, device
+    # ⭐ v0.6.27：openai-whisper 本来就返回 result["segments"]，同样留住。
+    seg_out = [
+        {
+            "start": round(float(s.get("start") or 0.0), 3),
+            "end": round(float(s.get("end") or 0.0), 3),
+            "text": (s.get("text") or "").strip(),
+        }
+        for s in (result.get("segments") or [])
+    ]
+    return text, device, seg_out
 
 
 def resolve_whisper_device(device_preference: str) -> str:

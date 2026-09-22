@@ -30,7 +30,7 @@ def directions_prompt(topic: str, videos: list[dict]) -> str:
     """
     import json
     listing = [
-        {"index": i, "title": v["title"], "up": v["up"], "desc": v.get("desc", "")[:120]}
+        {"index": i, "title": v.get("title", ""), "up": v.get("up", ""), "desc": (v.get("desc") or "")[:120]}
         for i, v in enumerate(videos)
     ]
     return (
@@ -111,16 +111,21 @@ def materials_for_prompt(main: list[dict], adv: list[dict]) -> str:
         out = []
         for m in lst:
             out.append({
-                "bvid": m["bvid"],
-                "title": m["title"],
-                "up": m["up"],
+                # 文档/文章类素材没有 BV 号 —— 这里不能写死必填键（曾经会 KeyError 把整次地图生成弄挂）
+                "bvid": m.get("bvid", ""),
+                "title": m.get("title", ""),
+                "up": m.get("up", ""),
                 "plays": m.get("plays", ""),
                 "desc": (m.get("desc") or "")[:240],
+                # ⭐ P3（2026-09-22）：优先吃“已总结素材”（digest = 带出处的要点/锚点段落），
+                #   没有才退回字幕摘录。地图不该重读全文，也不该只看标题。
+                "digestSource": m.get("digestSource", ""),
+                "kind": m.get("kind", "video"),
                 "segments": [
-                    {"sec": s["sec"], "text": s["text"][:80]}
+                    {"sec": s.get("sec", 0), "text": str(s.get("text", ""))[:80]}
                     for s in (m.get("segments") or [])[:6]
                 ],
-                "summary": (m.get("subtitleExcerpt") or "")[:400],
+                "summary": (m.get("digest") or m.get("subtitleExcerpt") or "")[:800],
             })
         return out
 

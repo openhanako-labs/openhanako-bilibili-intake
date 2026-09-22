@@ -25,7 +25,9 @@
  */
 
 import { APP_ID } from "./lib/env.js";
+import path from "node:path";
 import { legacyCtx } from "./lib/legacy-ctx.js";
+import { backfillFromCaptures } from "./lib/records.js";
 import { registerTools } from "./lib/register-tools.js";
 import { registerRoutes } from "./lib/register-routes.js";
 
@@ -53,6 +55,24 @@ export async function apply(ctx) {
   } catch (e) {
     log.error("路由注册失败", { error: e.message });
   }
+
+  // ⭐ 2026-09-22：启动时把 captures 里还没登记成记录的采集回填一次。
+  //   以前只在卡片「记录」tab 渲染**且记录为空**时触发 —— 既依赖人去点那个 tab，
+  //   又只要有一条记录就再也不跑（旧采集永远睡着）。
+  //
+  //   ⚠️ 用 setTimeout 推迟到 apply() **返回之后**再跑：回填是同步 fs 批量活（每个揃位
+  //   读写一次 records.json），夹在启动流程里会撞在宿主的启动握手窗口上（实测：夹在里面时
+  //   路由/设置都注册成功、工具回调通道却是死的 → 调用回 RPC peer closed）。
+  setTimeout(() => {
+    try {
+      const stats = backfillFromCaptures(ctx, path.join(lctx.dataDir, "captures"));
+      if (stats.created || stats.updated) {
+        log.info(`记录回填：扫描 ${stats.scanned}，新建 ${stats.created}，更新 ${stats.updated}，跳过/失败 ${stats.failed}`);
+      }
+    } catch (e) {
+      log.error("记录回填失败（不影响启动）", { error: e.message });
+    }
+  }, 0);
 
   return () => {
     for (const off of disposers) {

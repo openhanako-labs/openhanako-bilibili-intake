@@ -350,6 +350,9 @@ def _run_single(args: argparse.Namespace) -> None:
     audio_path = None
     transcribe_device = None
     transcription_error = None
+    # ⭐ v0.6.27：Whisper 的段落级时间轴（锚点）。以前只在函数内部拼成纯文本就丢，
+    #   导致"无平台字幕、只能靠 Whisper"的视频完全没有锚点可用。
+    transcript_segments: list = []
     try:
         if not args.no_audio:
             if args.force_transcribe:
@@ -358,14 +361,14 @@ def _run_single(args: argparse.Namespace) -> None:
                 #   对任何有平台字幕的视频（B 站基本都有 AI 字幕）都是死参数，
                 #   而且 transcriptSource 仍然报 platform_subtitle——调用方完全看不出来。
                 audio_path = download_audio(source, output_dir, args.audio_format, args.cookies_file)
-                transcript_text, transcribe_device = transcribe_audio(
+                transcript_text, transcribe_device, transcript_segments = transcribe_audio(
                     audio_path, args.whisper_model, args.whisper_language, args.whisper_device
                 )
             elif transcript_text != "":
                 pass  # 已有平台字幕，不重复下载音频
             else:
                 audio_path = download_audio(source, output_dir, args.audio_format, args.cookies_file)
-                transcript_text, transcribe_device = transcribe_audio(
+                transcript_text, transcribe_device, transcript_segments = transcribe_audio(
                     audio_path, args.whisper_model, args.whisper_language, args.whisper_device
                 )
     except Exception as exc:
@@ -429,6 +432,22 @@ def _run_single(args: argparse.Namespace) -> None:
         text_path.write_text(transcript_text, encoding="utf-8")
         result["transcriptText"] = transcript_text
         result["transcriptTextPath"] = str(text_path)
+
+    # ⭐ v0.6.27：转写段落单独落盘（锚点）。上层 lib/anchors.js 依次找
+    #   transcript_merged.json（长音频分块）→ transcript_segments.json（本次新增）
+    #   → 平台字幕文件。
+    if transcript_segments:
+        seg_path = output_dir / "transcript_segments.json"
+        seg_path.write_text(
+            json.dumps(
+                {"source": "whisper", "device": transcribe_device, "segments": transcript_segments},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        result["transcriptSegmentsPath"] = str(seg_path)
+        result["transcriptSegmentCount"] = len(transcript_segments)
 
     # Add visual analysis to result
     if visual_result:
@@ -920,6 +939,26 @@ def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) ->
 
     item["platform"] = platform_id
     item["source"] = source
+
+    # ⭐ v0.6.27（P1）：非 B 站平台（笔记 / 文章 / 回答 / 帖子）也要产出统一的"文本层"。
+    #   以前只有视频侧写 text.txt，文章类正文只躺在 result 的 description / content 里 ——
+    #   于是"素材 → 文本 → 总结"这条链一到文章就断：没 text.txt、没锚点、没产物可读。
+    #   这里取最长的可用正文字段落 text.txt，并把锚点类型标成 article（文章用字符/小节坐标，不是时间轴）。
+    article_text = ""
+    for key in ("transcriptText", "content", "description", "text", "body", "answer"):
+        val = item.get(key)
+        if isinstance(val, str) and val.strip() and len(val.strip()) > len(article_text):
+            article_text = val.strip()
+    if article_text:
+        if not item.get("transcriptText"):
+            item["transcriptText"] = article_text
+        text_path = output_dir / "text.txt"
+        text_path.write_text(article_text, encoding="utf-8")
+        item["transcriptTextPath"] = str(text_path)
+        item["textKind"] = "article"
+        item["textChars"] = len(article_text)
+        log(f"article text layer written: {len(article_text)} chars")
+
     item["outputDir"] = str(output_dir)
     write_json(output_dir / "result.json", item)
 
@@ -1033,7 +1072,7 @@ def main() -> int:
                 transcript = choose_subtitle_text(subs, args.subtitle_languages)
                 if not args.no_audio and (args.force_transcribe or not transcript):
                     audio = download_audio(tmp_source, tmp_output, args.audio_format, args.cookies_file)
-                    transcript, dev = transcribe_audio(audio, args.whisper_model, args.whisper_language, args.whisper_device)
+                    transcript, dev, _segs = transcribe_audio(audio, args.whisper_model, args.whisper_language, args.whisper_device)
 
                 # Write transcript text to file
                 if transcript:

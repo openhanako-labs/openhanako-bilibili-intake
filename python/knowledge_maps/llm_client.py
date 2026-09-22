@@ -14,7 +14,12 @@ import os
 from typing import Any
 
 import httpx
-from openai import OpenAI
+# ⭐ 2026-09-22（P3）：不再依赖 `openai` 包。
+#   App 的 venv 里只装了 requirements.txt 里那些（httpx 在内，openai 不在），
+#   而地址、模型、key 本来就是从环境变量读的 —— 包这个依赖只用了一次
+#   `client.chat.completions.create`。实测：map/directions/challenge 三个模式
+#   全部在 `from openai import OpenAI` 这一行 ModuleNotFoundError，
+#   即知识地图的 LLM 链路在本 App 里从来没跑通过。改成 httpx 直连，少一个依赖。
 
 # 配置：从环境变量读取，与插件统一配置
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -23,17 +28,13 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
 LLM_RETRIES = int(os.environ.get("LLM_RETRIES", "3"))
 
-_client: OpenAI | None = None
 _mode: str | None = None  # None=未知, "chat"=Chat Completions, "messages"=Messages API
 
 
-def _get_client() -> OpenAI:
-    global _client
+def _require_key() -> str:
     if not OPENAI_API_KEY:
-        raise RuntimeError("未配置 OPENAI_API_KEY")
-    if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=LLM_TIMEOUT)
-    return _client
+        raise RuntimeError("未配置 OPENAI_API_KEY（环境变量；App 子进程的 env 是白名单，创建进程时显式传入）")
+    return OPENAI_API_KEY
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -53,28 +54,45 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _call_chat(system: str, user: str, temperature: float, use_json: bool) -> dict[str, Any]:
-    """OpenAI Chat Completions 形态。"""
-    client = _get_client()
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    kwargs: dict[str, Any] = {"model": OPENAI_MODEL, "messages": messages, "temperature": temperature}
+    """OpenAI Chat Completions 形态（httpx 直连，不依赖 openai 包）。"""
+    key = _require_key()
+    url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
+    payload: dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+    }
     if use_json:
-        kwargs["response_format"] = {"type": "json_object"}
-    resp = client.chat.completions.create(**kwargs)
-    content = resp.choices[0].message.content or ""
+        payload["response_format"] = {"type": "json_object"}
+    resp = httpx.post(
+        url,
+        headers={"Authorization": f"Bearer {key}", "content-type": "application/json"},
+        json=payload,
+        timeout=LLM_TIMEOUT,
+    )
+    # ⭐ 带响应体报错：`raise_for_status()` 只会说“400 Bad Request”，
+    #   而真正的原因（模型不存在 / 不支持 response_format / 参数不合法）都在 body 里。
+    #   顺带：complete_json 的重试判断看的是错误文本，带上 body 才能触发“去掉 response_format 重试”。
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}（{OPENAI_MODEL} @ {url}）：{resp.text[:400]}")
+    data = resp.json()
+    choices = data.get("choices") or []
+    content = ((choices[0].get("message") or {}).get("content") if choices else "") or ""
+    if not content:
+        raise ValueError(f"LLM 返回为空（{OPENAI_MODEL} @ {url}）：{str(data)[:300]}")
     return _extract_json(content)
 
 
 def _call_messages(system: str, user: str, temperature: float) -> dict[str, Any]:
     """Anthropic 风格 Messages API 形态（/messages）。"""
-    if not OPENAI_API_KEY:
-        raise RuntimeError("未配置 OPENAI_API_KEY")
+    key = _require_key()
     url = OPENAI_BASE_URL.rstrip("/") + "/messages"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "x-api-key": OPENAI_API_KEY,
+        "Authorization": f"Bearer {key}",
+        "x-api-key": key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }

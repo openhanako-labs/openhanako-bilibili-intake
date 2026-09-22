@@ -470,11 +470,13 @@ def _supply_prompt(
 ) -> str:
     packed = [
         {
-            "bvid": m["bvid"],
-            "title": m["title"],
-            "up": m["up"],
-            "segments": [{"sec": s["sec"], "text": s["text"][:80]} for s in (m.get("segments") or [])[:5]],
-            "summary": (m.get("subtitleExcerpt") or m.get("desc") or "")[:300],
+            # 文档/文章类素材没有 BV 号 —— 别写死必填键
+            "bvid": m.get("bvid", ""),
+            "title": m.get("title", ""),
+            "up": m.get("up", ""),
+            "segments": [{"sec": s.get("sec", 0), "text": str(s.get("text", ""))[:80]} for s in (m.get("segments") or [])[:5]],
+            # ⭐ P3：优先吃已总结素材（digest），其次字幕摘录，最后才是简介
+            "summary": (m.get("digest") or m.get("subtitleExcerpt") or m.get("desc") or "")[:800],
         }
         for m in materials
     ]
@@ -542,9 +544,11 @@ def map_to_markdown(map_data: dict[str, Any]) -> str:
             elif kind == "clip":
                 sec = vid.get("startSec", 0)
                 bvid = vid.get("bvid", "")
-                ts = f"{sec // 60}:{sec % 60:02d}" if sec else "?"
-                url = f"https://www.bilibili.com/video/{bvid}?t={sec}" if bvid else ""
-                lines.append(f"  - 📌 {title} `@{ts}`")
+                # ⭐ 2026-09-22：没有秒数（文档/文章类素材根本没有时间轴）就不写 `@?` ——
+                #   以前会渲染成 `📌 标题 \`@?\``，看上去像个坏掉的跳转。
+                ts = f"{sec // 60}:{sec % 60:02d}" if sec else ""
+                url = f"https://www.bilibili.com/video/{bvid}?t={sec}" if (bvid and sec) else ""
+                lines.append(f"  - 📌 {title}" + (f" `@{ts}`" if ts else ""))
                 if url:
                     lines.append(f"    - [跳转]({url})")
                 if node.get("summary"):
