@@ -259,6 +259,12 @@ function renderCapture(r) {
   const transNote = r.transcriptSource === "whisper"
     ? '<div class="cap-warn">Whisper 兜底转写（' + esc(r.transcriptDevice || "cpu") + ' 推理），人名专有名词可能不准。有平台字幕的视频建议不用 forceTranscribe。</div>'
     : "";
+  // ⭐ v0.6.27：音频已下载但转写失败 → 红色报错条。与 Whisper 黄条、cap-note 青条
+  //   分开，方便一眼看出「不是 Whisper 质量差」，而是真的挂了。
+  //   截断 120 字符（完整错误在 result.json 里），避免 SSL stack trace 把面板冲崩。
+  const transErr = (r.audioDownloaded === true && r.transcriptionError)
+    ? '<div class="cap-err">音频已下载但转写失败：' + esc(String(r.transcriptionError).slice(0, 120)) + '</div>'
+    : "";
   el.innerHTML = `
     <div class="cap-head">
       <div class="cap-title">${esc(r.title || "(无标题)")}</div>
@@ -274,6 +280,7 @@ function renderCapture(r) {
       ${r.comments ? '<span>已带评论</span>' : ""}
     </div>
     ${excerpt}
+    ${transErr}
     ${transNote}
     <div class="cap-note">音频 + Whisper 转写不在此处执行（路由 30s 封顶）。需要完整转写请用模型工具 bilibili_video_intake，传 background:true。</div>`;
 }

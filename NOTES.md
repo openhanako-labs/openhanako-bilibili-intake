@@ -1474,13 +1474,27 @@ ssl.create_default_context = _create_default_context_with_system_certs
 | 有音频、转写失败 | **true** | **非空** | **none** ← UI 可显示错误 |
 | 有音频、转写成功 | true | null | whisper |
 
-### 3. UI 待办
+### 3. UI：红色错误条（v0.6.27 补）
 
-`ui/intake-script.js` 现在只处理 `transcriptSource === "whisper"` 时的
-琥珀色警告条（v0.6.19 加的）。下一步补一条：
+`ui/intake.html` 新增 `.cap-err` 样式（红色左边线，与 `.cap-warn` 同宽同字号，仅颜色区分），
+`ui/intake-script.js` 的 `renderCapture()` 新增一段：
 
-- 当 `audioDownloaded === true && transcriptionError != null` 时，
-  显示红色错误条，内容截断 `transcriptionError` 前 120 字符。
+```js
+const transErr = (r.audioDownloaded === true && r.transcriptionError)
+  ? '<div class="cap-err">音频已下载但转写失败：' + esc(String(r.transcriptionError).slice(0, 120)) + '</div>'
+  : "";
+```
+
+拼到 `excerpt` 之后、`transNote` 之前。120 字符截断，避免 SSL stack trace
+把面板冲崩；完整错误在 `result.json` 里。
+
+现在面板上有三层颜色，一眼分出：
+
+| 类型 | class | 颜色 | 触发条件 |
+|------|-------|------|---------|
+| 信息 | `.cap-note` | 青 | 总是（「转写不在本 UI 执行」提示） |
+| 警告 | `.cap-warn` | 珀色 | `transcriptSource === "whisper"` |
+| 错误 | `.cap-err` | 红 | `audioDownloaded && transcriptionError` |
 
 ### 4. 没改的部分
 

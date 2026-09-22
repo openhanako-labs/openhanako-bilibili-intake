@@ -111,6 +111,9 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
 .cap-note{font-size:10.5px;color:var(--ink-3);margin-top:10px;line-height:1.5;padding:8px 11px;border-left:2px solid var(--accent-line);background:var(--accent-lt);border-radius:0 4px 4px 0}
 /* Whisper 兜底转写的警告提示：颜色用琥珀，和 cap-note 的青色区分 */
 .cap-warn{font-size:10.5px;color:#8a6420;margin-top:8px;line-height:1.5;padding:8px 11px;border-left:2px solid #d4a24c;background:#fdf6e8;border-radius:0 4px 4px 0}
+/* v0.6.27：音频已下载但 Whisper 转写失败 → 红色提示，内容截断 120 字符
+   与 cap-note / cap-warn 同宽同字号，只有颜色区分 */
+.cap-err{font-size:10.5px;color:var(--err);margin-top:8px;line-height:1.5;padding:8px 11px;border-left:2px solid var(--err);background:rgba(168,85,74,.08);border-radius:0 4px 4px 0;white-space:pre-wrap;word-break:break-all}
 
 /* ── 搜索结果 ── */
 .srow{display:flex;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin-bottom:7px;transition:border-color var(--dur)}
