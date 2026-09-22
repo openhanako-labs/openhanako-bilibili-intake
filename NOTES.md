@@ -1644,3 +1644,24 @@ v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采
 - `lib/tasks.js`：`submitBackground` 支持 `deps.startText`，让不同工具能说自己的开场句（之前不管是采集还是生地图一律说“已在后台开始采集”）。
 - 错误改成**抛异常**统一处理：前台 → `toToolError`，后台 → `tasks.fail`（信息不再半路丢掉）。
 - `pipeline.map_to_markdown`：文档/文章素材没有时间轴，剪片段不再渲染 `` `@?` ``（看着像坏掉的跳转）。
+
+---
+
+## 变更记录 v0.6.34 → v0.6.35（2026-09-22）· 运行时自愈与采集超时四连修
+
+一次批量采集里全部踩中。前三条是 venv/torch 自愈链的设计缺口，第四条最好复现——**任何无平台字幕的长视频走工具路径必撞**。根因都与 Python 本身无关。
+
+**BUG-1（主因）`isVenvReady` 只看解释器在不在。** `ensurePythonEnvironment` 的就绪判据是 `fileExists(python.exe)`。半成品 venv（上次安装被打断、`site-packages/torch` 缺 `torch_version.py` 的孤儿目录）会让 python.exe 在、但 `import torch` 失败，却被判“就绪”，随后 hash 不匹配触发重装、pip 撞上孤儿目录退出码 1。
+修法：就绪判据升级为**一次真实 `import torch`**（复用 `queryTorchState`）。探活失败 → 不满足 → 走 `installTorch` 的 `pip uninstall torch`（清孤儿）+ 重装，可直接覆盖装成功。
+⚠️ 别改 `isVenvReady` 本身——`queryTorchState` 内部以它为前置，改了会自调用死循环；所以在调用方 `ensurePythonEnvironment` 叠一层 `venvUsable = venvReady && torchState.version`，并把探到的 `torchState` 传进 `isInstallSatisfied` 复用，避免重复 import。
+
+**BUG-2 `TORCH_INSTALL_FAILED` 没被翻译。** `prepareRuntime` 末尾只认出权限类失败（v0.6.5 修过那类），torch 安装失败直接落到兜底句「原生环境不可用 + WSL 兜底未成功」，把排查者引向“Python 装坏了”。而 `details` 里 `venvDir`/退出码/candidate 全在，只是没翻译。
+修法：源头 `installTorch` 抽 `buildTorchInstallFailure()`——message 直接写“删除 `<venv>\Lib\site-packages\torch` 后重试 / 手动 `pip install --index-url .../cpu torch` / 沙箱内失败就去宿主 shell 跑”；`prepareRuntime` 多模式聚合处也加分支认出 `TORCH_INSTALL_FAILED`。单模式的 installTorch 原始错误、多模式的聚合都自带下一步动作，不再有笼统兜底。
+
+**BUG-3 `reused` 自Guard 只护住 legacy。** `resolveRuntimeRoot` 命中 `source:"own"` 时 `reused:false`，自愈照跑撞上 BUG-1/2——守卫防住了“别人的目录”，没防住“自己目录里的历史包”。
+修法：**不改 `reused` 语义**（legacy 在盘外，`existsSync`/`fs` 检查必被 Node 权限模型拒，动了会踩 BUG-3 报告里那个坑）。`own` 命中 `reused:false` 会走完整自愈——BUG-1 探活失败先自动重装修，仍失败由 BUG-2 抛带指令的错误。a+b 由这两条组合覆盖，风险最低。
+
+**BUG-4（最好复现）采集路径从不传 `timeoutMs`。** `tools/bilibili_video_intake.js` → `ingestBilicVideo`/`ingestMulti`（`lib/service.js`）调 `runCollector(runtime, payload)` 全没传 `options.timeoutMs`，于是恒定走 `SPAWN_TIMEOUT_MS=180_000`。`background:true` 只把“等结果”异步化，没拆 spawn 层的墙。而 `http/intake.js` 每条路由都按需传了 `timeoutMs`、`runCollector` 也留了覆盖口——就是采集这条主路漏穿了。
+修法：`lib/service.js` 定义 `COLLECT_TIMEOUT_MS`(前台 30min) / `BACKGROUND_COLLECT_TIMEOUT_MS`(后台 2h)，`collectTimeoutMs(input)` 按 `input.background` 分流，两条采集主路都传。`ingestAction`(health/routing 秒回)保持 180s 不动。
+
+**教训**：路由层记得传超时、工具层忘了传——同一件事在两个入口做了不一样的处理。凡是 `runCollector`/`spawnAndCollect` 这类“默认 180s”的底层能力，**新增调用方时要把“要不要覆盖超时”当成必答题**，而不是可选项。

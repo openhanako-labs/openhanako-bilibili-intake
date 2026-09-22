@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "bilibili-intake-v2",
   "name": "内容摄取 (Bilibili Intake)",
-  "version": "0.6.34",
+  "version": "0.6.35",
   "description": "多平台内容摄取引擎 —— B站 / 小红书 / 微博 / 知乎 / 贴吧 / 抖音 / 快手。统一搜索、单条/笔记抓取、评论、创作者主页。\n\nB站走 yt-dlp 直连官方字幕（优先中文 AI 字幕、自动回退语言），无字幕时才用 Whisper 兜底转写；另有音频下载、视觉帧分析、知识地图生成。采集可丢后台，长视频不再撞 180 秒上限。\n\n采集产物统一落盘：正文 text.txt、字幕原始文件、artifact.json（kind / anchorKind / 正文 / 锚点 / 资源）、分析报告。长视频按时间轴分段交付，可 anchorOffset 分页续读，不再静默截断。\n\n本地文档走同一条链路：intake_document 支持 PDF / Office / 图片（复用环境里已装好的 doc-intake，带版面提取与 OCR），也支持 txt / md / html / docx / csv / json。\n\n采集过的内容在卡片「记录」里可查、可补写总结，产物路径与正文字数一并落记录；「历史」按 canonical id 去重。",
   "minAppVersion": "0.942.0",
   "entry": "index.js",
