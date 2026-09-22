@@ -19,6 +19,38 @@ Usage:
 """
 from __future__ import annotations
 
+# ⭐ v0.6.21：venv 在 Windows 上默认拿不到系统根证书，whisper / huggingface_hub
+# 下载模型会报 SSL: CERTIFICATE_VERIFY_FAILED（因为 Python 构建时 ssl
+# get_default_verify_paths 只看到 XBL Client IPsec CA 这种企业 CA）。
+# 把 ssl.create_default_context 包一层，在 Windows 上自动 load_default_certs，
+# 这样 requests / httpx / urllib / huggingface_hub 走默认 context 时都能过 TLS。
+# 必须在其他 import 之前，否则 openai-whisper 一 import 就预热了自己的客户端。
+try:
+    import ssl
+    _orig_create_default_context = ssl.create_default_context
+    def _create_default_context_with_system_certs(*args, **kwargs):
+        ctx = _orig_create_default_context(*args, **kwargs)
+        try:
+            ctx.load_default_certs()
+        except Exception:
+            pass
+        return ctx
+    ssl.create_default_context = _create_default_context_with_system_certs
+    # SSL_CERT_FILE 兼容回退：httpx 内部不读 ssl module，而是直接开新 context
+    # 从 env 读 cafile，所以顺手把 certifi 路径写进环境变量作为兜底。
+    try:
+        import os
+        import certifi
+        _CA_BUNDLE = certifi.where()
+        os.environ.setdefault("SSL_CERT_FILE", _CA_BUNDLE)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", _CA_BUNDLE)
+        os.environ.setdefault("CURL_CA_BUNDLE", _CA_BUNDLE)
+    except ImportError:
+        pass
+except Exception:
+    # 任何加载失败都不阻塞采集主流程，只是 SSL 可能继续失败。
+    pass
+
 import json
 import re
 import sys
@@ -317,6 +349,7 @@ def _run_single(args: argparse.Namespace) -> None:
     # 降级策略：音频失败不致命，继续往下走（评论、字幕、元数据都还在）。
     audio_path = None
     transcribe_device = None
+    transcription_error = None
     try:
         if not args.no_audio:
             if args.force_transcribe:
@@ -336,7 +369,11 @@ def _run_single(args: argparse.Namespace) -> None:
                     audio_path, args.whisper_model, args.whisper_language, args.whisper_device
                 )
     except Exception as exc:
-        log(f"[bilibili_pipeline] 音频下载/转写失败，降级跳过（metadata/字幕/评论不受影响）: {exc}")
+        # ⭐ v0.6.21：以前只 log 就吃掉，上层完全看不出来 Whisper 挂了。
+        #   transcriptSource 还是 "none"，和「没字幕没音频」无法区分。
+        #   把异常写进 result，让卡片能显示「音频已下载但转写失败：...」。
+        transcription_error = f"{type(exc).__name__}: {exc}"
+        log(f"[bilibili_pipeline] 音频下载/转写失败，降级跳过（metadata/字幕/评论不受影响）: {transcription_error}")
 
     # Step 5: Collect comments
     comments = []
@@ -372,8 +409,13 @@ def _run_single(args: argparse.Namespace) -> None:
         #   路径下照样报 platform_subtitle，而 transcript_text 已经是 Whisper 输出，
         #   调用方会以为拿到的是 B 站字幕。
         #   改看 transcribe_device 有没有被赋值：transcribe_audio() 只在真的跑过才会写它。
+        # ⭐ v0.6.21：transcriptSource="none" 以前无法区分「本来就没字幕」和
+        #   「音频下载成功但 Whisper 挂掉」两种情形，上层看到「采集完成」会误以为成功。
+        #   新加 audioDownloaded / transcriptionError，让 UI 能区分。
         "transcriptSource": "whisper" if transcribe_device is not None else ("platform_subtitle" if subtitle_files else "none"),
         "transcriptDevice": transcribe_device,
+        "audioDownloaded": audio_path is not None,
+        "transcriptionError": transcription_error,
         "comments": comments[:args.comment_limit],
     }
 

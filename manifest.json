@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "bilibili-intake-v2",
   "name": "内容摄取 (Bilibili Intake)",
-  "version": "0.6.26",
+  "version": "0.6.27",
   "description": "多平台内容摄取引擎 — B站/小红书/微博/知乎/贴吧/抖音/快手。统一搜索、单视频/笔记抓取、评论、创作者主页；B站带 yt-dlp 字幕优先 + Whisper 兜底转写、音频下载、视觉帧分析。采集可丢后台，长视频不再撞 180 秒上限。v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采集过的内容带总结落盘，卡片轮询展示。v0.6.17：卡片性能（图片 1.2MB→133KB、health/cookies 加 TTL 缓存）、长总结折叠展开、记录 canonical id 修重复。v0.6.18：forceTranscribe 生效（旧逻辑被「已有字幕就跳过」短路，对有平台字幕的视频一直是死参数，batch 模式同修）。v0.6.19：transcriptSource 报告修正（旧写法看「有没有字幕文件」，force_transcribe 跑过也报 platform_subtitle；改为看 transcribe_device 是否被赋值）。v0.6.20：卡片搜索的平台选择终于生效（前端 API.search 不带 platform、后端搜索分支不读 args.platform，两头都丢；单视频模式会读，搜索模式不读，两条路径不一致）；卡片修 6 处（搜索平台、转写字段名、展开状态跨轮询、非 JSON 容错、prompt 链取消不中断、stub 平台标注）。",
   "minAppVersion": "0.942.0",
   "entry": "index.js",

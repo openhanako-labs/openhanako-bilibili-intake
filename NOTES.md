@@ -1413,6 +1413,90 @@ PARTIAL_PLATS 的 title 从"部分支持：能拿元数据，评论功能未实�
 - zhihu/tieba get_comments 保持空实现
 - xhs 需要 Playwright（用户之前明确不装）
 
+---
+
+## v0.6.27（2026-09-22）SSL 证书修复 + 转写失败可观测
+
+### 背景
+
+采 BV1CXet6gE6X（无平台字幕）时，插件返回「B站视频采集完成，字幕来源：none」，
+上层完全看不出来 Whisper 挂了——`audio.mp3` 都已下载（26MB），但转写报
+`SSL: CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`，
+被 Step 4 的 try/except 吞掉后降级。调用方看到的「完成」是个语义错误的成功。
+
+根因：venv 里 `ssl.get_default_verify_paths()` 只看到 `XBL Client IPsec CA`
+（企业自签），不包含 Windows 系统根 CA 仓库。faster-whisper → huggingface_hub
+下载模型时走 httpx → 默认 context 无证书 → 握手失败。
+
+### 1. SSL：Windows 系统 CA 自动加载（v0.6.27 修）
+
+`collector.py` 顶部插一段，在任何下游库 import 之前把
+`ssl.create_default_context` 包一层：
+
+```python
+import ssl
+_orig_create_default_context = ssl.create_default_context
+def _create_default_context_with_system_certs(*args, **kwargs):
+    ctx = _orig_create_default_context(*args, **kwargs)
+    try:
+        ctx.load_default_certs()  # Windows: 从 cert:\localmachine\root 读系统根 CA
+    except Exception:
+        pass
+    return ctx
+ssl.create_default_context = _create_default_context_with_system_certs
+```
+
+顺手把 `certifi.where()` 写进 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` /
+`CURL_CA_BUNDLE` 环境变量兜底。`requirements.txt` 加 `certifi` 显式声明
+（其实 scrapling/requests 已经带了这个依赖，但既然显式用了就要显式写）。
+
+**验证**：同视频重跑，Whisper 正常走完，`transcriptSource: whisper`、
+`transcriptDevice: cpu`、`text.txt` 6.7KB。日志只留一条无害的
+`unauthenticated requests to HF Hub` 提示。
+
+### 2. 转写失败可观测（v0.6.27 修）
+
+旧写法把「音频下载/转写失败」和「本来就没字幕」混成一个 `transcriptSource: "none"`，
+上层无法区分。Step 4 的 try/except 里加 `transcription_error` 捕获，
+`result.json` 加两个字段：
+
+```json
+"audioDownloaded": true,
+"transcriptionError": "LocalEntryNotFoundError: ...",
+```
+
+现在三个状态可区分：
+
+| 情形 | audioDownloaded | transcriptionError | transcriptSource |
+|------|-----------------|--------------------|------------------|
+| 无音频、有字幕 | false | null | platform_subtitle |
+| 无音频、无字幕 | false | null | none |
+| 有音频、转写失败 | **true** | **非空** | **none** ← UI 可显示错误 |
+| 有音频、转写成功 | true | null | whisper |
+
+### 3. UI 待办
+
+`ui/intake-script.js` 现在只处理 `transcriptSource === "whisper"` 时的
+琥珀色警告条（v0.6.19 加的）。下一步补一条：
+
+- 当 `audioDownloaded === true && transcriptionError != null` 时，
+  显示红色错误条，内容截断 `transcriptionError` 前 120 字符。
+
+### 4. 没改的部分
+
+- **没把降级改成失败**：无音频时仍能拿到字幕/评论的路径保留，
+  只是把「有音频但转写失败」这条特定失败面暴露出来。
+- **没加 `--strict-transcription` flag**：留一个开关更硬，但会破坏
+  「失败不致命」的整体风格。等真有人撞到再说。
+
+### 5. .xml 字幕（不是 bug，澄清一下）
+
+BV1CXet6gE6X 日志里有 `danmaku detected: subtitle.danmaku.xml`，看起来像
+字幕漏抓。查了 `subtitle_parser.py`：B站 AI 字幕是 `.vtt`，弹幕是 `.xml`，
+两者不能混。`_REAL_SUBTITLE_EXTS` 里 `.xml` 故意没进。
+这个视频确实没有 AI 字幕（yt-dlp 只拿到弹幕），所以走 Whisper 兜底是正确路径。
+
+
 
 
 

@@ -5,6 +5,11 @@ requests
 playwright
 curl_cffi
 msgspec
+# ⭐ v0.6.21：显式声明。venv 不继承系统 CA，whisper/huggingface_hub 下载模型
+# 会报 SSL CERTIFICATE_VERIFY_FAILED。collector.py 启动时把 certifi 证书
+# 路径写进 SSL_CERT_FILE，让所有 https 客户端都能过 TLS。
+certifi
+
 # Multi-platform support (v0.2+)
 httpx
 parsel
