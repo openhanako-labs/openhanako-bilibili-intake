@@ -20,7 +20,9 @@ import path from "node:path";
 import { getSettings } from "../lib/settings.js";
 import { prepareRuntime, runCollector, runCollectorArgs } from "../lib/runtime.js";
 // ⭐ 2026-09-22：记录读写抽到共享实现（卡片侧与模型工具侧同一份）。
-import { backfillFromCaptures, canonicalId, listRecords, patchFromResult, readRecords, upsertRecord, writeRecords } from "../lib/records.js";
+import { backfillFromCaptures, canonicalId, listRecords, patchFromResult, readRecords, reconcileSummaries, recordsStamp, upsertRecord, writeRecords } from "../lib/records.js";
+// ⭐ W3（2026-09-26）：删除（记录 + 本地产物）与缓冲。
+import { emptyTrash, listTrash, purgeRecords } from "../lib/purge.js";
 import { writeArtifact } from "../lib/artifacts.js";
 
 /**
@@ -171,6 +173,33 @@ export default function (app, ctx) {
           result.savedRecordId = record.id;
         } catch (e) { result.saveRecordError = e?.message || String(e); }
       }
+      // ⭐ 2026-09-26：采集完**自动**写总结（用户原话「要自动」）。
+      //   形态：走宿主模型通道（app/models.infer），不往对话里插消息、不需要用户在场；
+      //   产物与助手写的完全同源（summary.json + 记录回写）。
+      //   为什么是后台跑（不 await）：宿主对 App 路由有 30s 封顶，而模型一次要几十秒 ——
+      //   等它就会把「采集成功」变成「请求超时」。后台跑完，卡片 15s 轮询自然就把总结显示出来。
+      //   关掉它：设置 summaryAuto = false。
+      if (body.autoSummary !== false && mode !== "batch" && result?.title) {
+        try {
+          const { getSettings } = await import("../lib/settings.js");
+          const settings = await getSettings(ctx);
+          if (settings.summaryAuto) {
+            const { autoSummarize } = await import("../lib/auto-summary.js");
+            const slotDir = result.outputDir || outputDir;
+            result.autoSummary = { pending: true };
+            void autoSummarize(ctx, { slotDir })
+              .then((r) => {
+                ctx.log?.info?.(`自动总结${r?.ok ? "完成" : "未完成"}：${slotDir}`
+                  + (r?.ok ? `（要点 ${r.counts?.total ?? 0} 个 · 回指 ${r.counts?.grounded ?? 0}）` : `（${r?.reason || r?.error || "未知原因"}）`));
+              })
+              .catch((e) => ctx.log?.warn?.("自动总结异常", { error: e?.message || String(e) }));
+          } else {
+            result.autoSummary = { skipped: true, reason: "设置里关了「采集后自动写总结」" };
+          }
+        } catch (e) {
+          result.autoSummary = { ok: false, error: e?.message || String(e) };
+        }
+      }
       return c.json(result);
     } catch (e) { return fail(c, e); }
   });
@@ -307,14 +336,13 @@ export default function (app, ctx) {
         const child = spawn(getVenvPython(runtime), ["-c", code], {
           windowsHide: true,
           env: {
-            ...process.env,
-            OPENAI_API_KEY: key,
-            OPENAI_BASE_URL: baseUrl || "https://api.openai.com/v1",
-            OPENAI_MODEL: model,
-            PYTHONUTF8: "1",
-            PYTHONIOENCODING: "utf-8",
-          },
-        });
+              ...process.env,
+              OPENAI_API_KEY: key,
+              OPENAI_BASE_URL: baseUrl || "https://api.openai.com/v1",
+              OPENAI_MODEL: model,
+              PYTHONUTF8: "1",
+              PYTHONIOENCODING: "utf-8",
+            },        });
         let stdout = "";
         let stderr = "";
         const timer = setTimeout(() => { try { child.kill("SIGTERM"); } catch { /* 已退出 */ } }, 25000);
@@ -387,12 +415,17 @@ export default function (app, ctx) {
   app.get("/intake/records", (c) => {
     try {
       const limit = Math.max(1, Math.min(200, parseInt(c.req.query("limit") || "100", 10)));
+      // ⭐ 2026-09-26：带 rev 时先比版本 —— 版本没变就不读盘、不出列表，只回一句 unchanged。
+      //   卡片每 15 秒轮询一次，正常情况下的每一轮都从这里返回（几十字节）。
+      const rev = c.req.query("rev") || "";
+      const stamp = recordsStamp(ctx);
+      if (rev && rev === stamp) return c.json({ ok: true, unchanged: true, rev: stamp });
       // ⭐ 2026-09-22：以前是 all.slice(-limit).reverse()（按**插入顺序**取最后 N 条）。
       //   补写总结走的是 upsert（原地更新、createdAt 保留），所以刚补完总结的记录
       //   既不上浮、显示时间也还是旧的 —— 卡片看起来就是"没同步"。
       //   改按 updatedAt（缺失时退回 createdAt）倒序。
       const { total, items } = listRecords(ctx, limit);
-      return c.json({ ok: true, total, items });
+      return c.json({ ok: true, total, items, rev: stamp });
     } catch (e) { return fail(c, e); }
   });
 
@@ -415,15 +448,41 @@ export default function (app, ctx) {
     } catch (e) { return fail(c, e); }
   });
 
+  // ⭐ W3（2026-09-26）：删除不再只删记录 —— **记录与本地产物一起删**。
+  //   规则见 lib/purge.js：直接删；只有「已总结」的槽位把总结后产生的文件
+  //   （summary.json / summary.md / summary-history）先挪进 captures/.trash/。
+  //   二次确认在卡片侧做（确认条），这里只负责执行。
   app.delete("/intake/record/:id", (c) => {
     try {
       const id = c.req.param("id");
-      const all = readRecords(ctx);
-      const next = all.filter(r => r.id !== id);
-      if (next.length === all.length) return c.json({ ok: false, error: "not found" }, 404);
-      writeRecords(ctx, next);
-      return c.json({ ok: true });
+      const r = purgeRecords(ctx, [id], { capturesDir: path.join(dataDir, "captures") });
+      if (!r.deleted) {
+        return c.json({ ok: false, error: r.items[0]?.error || "删除失败", detail: r }, 404);
+      }
+      return c.json({ ok: true, ...r });
     } catch (e) { return fail(c, e); }
+  });
+
+  // ⭐ W3：批量删除。body: { ids: [...] }
+  app.post("/intake/records/purge", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const ids = Array.isArray(body?.ids) ? body.ids : [];
+      if (!ids.length) return c.json({ ok: false, error: "ids 不能为空" }, 400);
+      const r = purgeRecords(ctx, ids, { capturesDir: path.join(dataDir, "captures") });
+      return c.json({ ok: true, ...r });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ⭐ W3：缓冲查看 / 清空 —— 删「已总结」的槽位时留下的总结文件在这里。
+  app.get("/intake/trash", (c) => {
+    try { return c.json({ ok: true, ...listTrash(path.join(dataDir, "captures")) }); }
+    catch (e) { return fail(c, e); }
+  });
+
+  app.post("/intake/trash/empty", (c) => {
+    try { return c.json({ ok: true, ...emptyTrash(path.join(dataDir, "captures")) }); }
+    catch (e) { return fail(c, e); }
   });
 
   // ── API: 从 captures 回填记录（2026-09-22）──
@@ -436,12 +495,26 @@ export default function (app, ctx) {
     try {
       // 实现抽到 lib/records.js（App 启动时也会跑一次，见 index.js）——
       // 两处共用一份，避免「卡片点一次」与「启动回填」两套逻辑各走各的。
-      const stats = backfillFromCaptures(ctx, path.join(dataDir, "captures"));
-      return c.json({ ok: true, ...stats });
+      const capturesDir = path.join(dataDir, "captures");
+      const stats = backfillFromCaptures(ctx, capturesDir);
+      // ⭐ W4：顺带跑一次摘要对账（把「有 summary.json、记录里却空着」的补上）。
+      const summaries = reconcileSummaries(ctx, capturesDir);
+      return c.json({ ok: true, ...stats, summaries });
     } catch (e) { return fail(c, e); }
   });
 
-  // ── API: 读回采集产物（2026-09-22）──
+  // ⭐ 2026-09-26：扫码登录。
+  //   以前只能从命令行 `--login xhs` 做，卡片里没有入口 —— 而小红书**没有 cookies 就取不到内容**。
+  //   登录态与登出走已有的 /intake/cookies 与 /intake/cookies-logout（它们已经正确传了
+  //   --cookies-dir），这里只补上缺的那一条，不重复造。
+  //
+  //   ⚠️ cookies 必须落到 <dataDir>/cookies：不带 --cookies-dir 时 Python 那边会落到**源码目录**
+  //   （实测 --list-logins 回的 cookies_dir 是 apps/bilibili-intake-v2/python）。
+  //   ⚠️ 扫码是交互动作：playwright_login 会**弹出真实 Chromium 窗口**，所以给 200 秒超时。
+  //   即使外层把请求提早断了也不丢：cookies 是子进程自己落盘的。
+        
+          
+// ── API: 读回采集产物（2026-09-22）──
   //
   // 回答的就是那个疑虑：「总结之后文件到底有没有保留、能不能读回来」。
   // 传记录里的 artifactDir（或 captures 下的槽位名），返回文件清单 + 正文分页。
@@ -456,6 +529,21 @@ export default function (app, ctx) {
         return c.json({ ok: false, error: "只允许读 captures 目录内的产物" }, 400);
       }
       if (!fs.existsSync(target)) return c.json({ ok: false, error: "目录不存在: " + target }, 404);
+      // ⭐ 2026-09-26：传 file 时直接吐单个文件的内容（卡片「报告」弹窗要内嵌 report.html）。
+      //   边界与上面同一套：必须落在 captures 之内（防目录穿越）。
+      const wantFile = c.req.query("file") || "";
+      if (wantFile) {
+        const fp = path.resolve(path.join(target, wantFile));
+        if (fp !== root && !fp.startsWith(root + path.sep)) {
+          return c.json({ ok: false, error: "只允许读 captures 内的文件" }, 400);
+        }
+        if (!fs.existsSync(fp) || !fs.statSync(fp).isFile()) {
+          return c.json({ ok: false, error: "文件不存在: " + wantFile }, 404);
+        }
+        const body = fs.readFileSync(fp, "utf-8");
+        return c.json({ ok: true, file: wantFile, size: Buffer.byteLength(body), isHtml: /\.html?$/i.test(fp), content: body });
+      }
+
       const files = [];
       for (const name of fs.readdirSync(target)) {
         try {

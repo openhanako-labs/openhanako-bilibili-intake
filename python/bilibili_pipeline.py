@@ -320,7 +320,7 @@ def download_subtitles(source: str, output_dir: Path, subtitle_languages: list[s
 # ── Whisper transcription ──
 
 
-def transcribe_audio(audio_path: Path, model_name: str, language: str, device_preference: str) -> tuple[str, str, list]:
+def transcribe_audio(audio_path: Path, model_name: str, language: str, device_preference: str, cpu_threads: Any = 0) -> tuple[str, str, list]:
     """Transcribe audio using Whisper. Returns (text, device_used, segments)。
 
     ⭐ v0.6.27：把段落一起还回去。以前只回 `"".join(seg.text)` 的纯文本，
@@ -335,12 +335,12 @@ def transcribe_audio(audio_path: Path, model_name: str, language: str, device_pr
     """
     try:
         from faster_whisper import WhisperModel
-        return _transcribe_faster_whisper(audio_path, model_name, language, device_preference, WhisperModel)
+        return _transcribe_faster_whisper(audio_path, model_name, language, device_preference, WhisperModel, cpu_threads)
     except ImportError:
         return _transcribe_openai_whisper(audio_path, model_name, language, device_preference)
 
 
-def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str, device_preference: str, WhisperModel) -> tuple[str, str, list]:
+def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str, device_preference: str, WhisperModel, cpu_threads: Any = 0) -> tuple[str, str, list]:
     """faster-whisper 实现：CTranslate2 后端，速度 4x。"""
     device = resolve_whisper_device(device_preference)
     model_ref = resolve_whisper_model_reference(model_name)
@@ -349,8 +349,15 @@ def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str,
     # - int8: CPU 最快，质量略有损失
     # - float16: CUDA 默认，质量更好
     compute_type = "int8" if device == "cpu" else "float16"
-    
-    model = WhisperModel(model_ref, device=device, compute_type=compute_type)
+
+    # ⭐ v0.6.38：不传 cpu_threads 的话，faster-whisper 默认就吃满所有核 ——
+    #   长视频一转写，整台机器就卡住。默认改成“一半的核”，见 resolve_whisper_cpu_threads。
+    threads = resolve_whisper_cpu_threads(cpu_threads, device)
+    model_kwargs: dict[str, Any] = {"device": device, "compute_type": compute_type}
+    if threads > 0:
+        model_kwargs["cpu_threads"] = threads
+
+    model = WhisperModel(model_ref, **model_kwargs)
     
     opts: dict[str, Any] = {}
     if language:
@@ -398,6 +405,38 @@ def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str,
         for s in (result.get("segments") or [])
     ]
     return text, device, seg_out
+
+
+def resolve_whisper_cpu_threads(preference: Any, device: str) -> int:
+    """CPU 跑 Whisper 时用多少线程。
+
+    ⭐ v0.6.38：faster-whisper 的 `cpu_threads` 默认是 **0 = 吃满所有核**。
+    以前没传过这个参数，于是一转写整台机器就卡住。现在默认改成“核数一半，最少 1”。
+
+      -1 / "all"  → 不限制（回 0，旧行为）
+       0 / "auto" → 自动：核数一半（最少 1）
+       N > 0       → 指定线程数
+
+    GPU 路径不用这个参数，直接回 0。
+    """
+    if device != "cpu":
+        return 0
+    raw = str(preference).strip().lower() if preference is not None else ""
+    if raw in ("", "auto"):
+        n = 0
+    elif raw == "all":
+        n = -1
+    else:
+        try:
+            n = int(float(raw))
+        except (TypeError, ValueError):
+            n = 0
+    if n < 0:
+        return 0
+    if n > 0:
+        return n
+    cores = os.cpu_count() or 2
+    return max(1, cores // 2)
 
 
 def resolve_whisper_device(device_preference: str) -> str:

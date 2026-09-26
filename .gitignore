@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 test-env/
 data/
+.bak-*/
+_*.mjs
+capture-*.mjs
+*.tmp

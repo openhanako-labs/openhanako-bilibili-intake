@@ -27,7 +27,12 @@
 import { APP_ID } from "./lib/env.js";
 import path from "node:path";
 import { legacyCtx } from "./lib/legacy-ctx.js";
-import { backfillFromCaptures } from "./lib/records.js";
+// ⭐ W2（2026-09-26）：画面描述那三格要有人"看" —— 走宿主模型通道（能力位 app/models.infer），
+//   不需要任何 API key。这里只把 ctx 转一手，用的时候再说。
+import { bindModels } from "./lib/model-host.js";
+import { backfillFromCaptures, reconcileSummaries } from "./lib/records.js";
+import { pruneTrash } from "./lib/purge.js";
+import { getSettings } from "./lib/settings.js";
 import { registerTools } from "./lib/register-tools.js";
 import { registerRoutes } from "./lib/register-routes.js";
 
@@ -39,6 +44,7 @@ export async function apply(ctx) {
 
   const lctx = legacyCtx(ctx);
   const log = lctx.log;
+  bindModels(ctx);
   log.info(`${APP_ID} v2 loaded`, { dataDir: lctx.dataDir, pluginDir: lctx.pluginDir });
 
   const disposers = [];
@@ -64,14 +70,44 @@ export async function apply(ctx) {
   //   读写一次 records.json），夹在启动流程里会撞在宿主的启动握手窗口上（实测：夹在里面时
   //   路由/设置都注册成功、工具回调通道却是死的 → 调用回 RPC peer closed）。
   setTimeout(() => {
+    const capturesDir = path.join(lctx.dataDir, "captures");
     try {
-      const stats = backfillFromCaptures(ctx, path.join(lctx.dataDir, "captures"));
+      const stats = backfillFromCaptures(ctx, capturesDir);
       if (stats.created || stats.updated) {
         log.info(`记录回填：扫描 ${stats.scanned}，新建 ${stats.created}，更新 ${stats.updated}，跳过/失败 ${stats.failed}`);
       }
     } catch (e) {
       log.error("记录回填失败（不影响启动）", { error: e.message });
     }
+    // ⭐ W4（2026-09-26）：摘要对账。“槽位有 summary.json 而记录里 summary 为空”
+    //   就补上 —— 这是“总结过但卡片显示未总结”的旧数据自愈入口。
+    //   与回填同处一个 setTimeout：都是同步 fs 批量活，不能夹在启动握手窗口里。
+    try {
+      const rs = reconcileSummaries(ctx, capturesDir);
+      if (rs.filled || rs.relinked) {
+        log.info(`摘要对账：扫描 ${rs.scanned}，补字段 ${rs.filled}，补归属 ${rs.relinked}，跳过 ${rs.skipped}，失败 ${rs.failed}`);
+      }
+    } catch (e) {
+      log.error("摘要对账失败（不影响启动）", { error: e.message });
+    }
+
+    // ⭐ 2026-09-26：删除缓冲清理（两道闸门：保留天数 / 体积上限）。
+    //   只删不写；没东西可删时一次 fs 写操作都不做。
+    //   放在这个 setTimeout 里，跟回填/对账一样避开启动握手窗口。
+    (async () => {
+      try {
+        const s = await getSettings(ctx);
+        const r = pruneTrash(capturesDir, {
+          maxAgeDays: Number(s.trashKeepDays) || 0,
+          maxBytes: (Number(s.trashMaxMB) || 0) * 1024 * 1024,
+        });
+        if (r.removed) {
+          log.info(`缓冲清理：删掉 ${r.removed} 项（${Math.round(r.bytes / 1024)}KB），原因：${r.reasons.join("、")}；剩余 ${r.kept} 项`);
+        }
+      } catch (e) {
+        log.error("缓冲清理失败（不影响启动）", { error: e.message });
+      }
+    })();
   }, 0);
 
   return () => {

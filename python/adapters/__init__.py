@@ -158,6 +158,26 @@ class PlatformAdapter:
             return self._cookies
         if self.cookies_file and Path(self.cookies_file).is_file():
             self._cookies = _read_netscape_cookies(self.cookies_file)
+        # ⭐ 2026-09-26：docstring 一直写着"或 cookies_dir（JSON）"，但这条分支从没实现过。
+        #   后果：卡片里粘好的登录态（落到 cookies/<平台>.json）adapter 完全看不到，
+        #   只会报"需要 cookies。请先 --login xhs" —— 而 --list-logins 明明说已登录。
+        #   这里补上：读的就是和 --list-logins / 导入接口同一份数据。
+        if not self._cookies:
+            try:
+                import json as _json
+                cdir = getattr(self, "cookies_dir", "") or ""
+                pid = getattr(self, "platform_id", "") or ""
+                cf = Path(cdir) / (pid + ".json") if (cdir and pid) else None
+                if cf is not None and cf.is_file():
+                    data = _json.loads(cf.read_text(encoding="utf-8"))
+                    out = {}
+                    for c in (data.get("cookies") or []):
+                        nm = c.get("name")
+                        if nm:
+                            out[str(nm)] = str(c.get("value") or "")
+                    self._cookies = out
+            except Exception:
+                pass
         return self._cookies
 
     def cookie_header(self) -> str:

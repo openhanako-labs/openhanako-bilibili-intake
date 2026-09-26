@@ -133,44 +133,6 @@ export const parameters = {
     },
 
     // Visual analysis (v0.3+)
-    visual: {
-      type: "boolean",
-      description: "启用视觉帧分析（默认 false，关闭）",
-      default: false,
-    },
-    visionBackend: {
-      type: "string",
-      enum: ["siliconflow", "openai", "qwen-local"],
-      description: "视觉模型后端（默认 siliconflow）",
-      default: "siliconflow",
-    },
-    frameDetail: {
-      type: "string",
-      enum: ["efficient", "balanced", "token-burner"],
-      description: "帧提取粒度（默认 balanced）",
-      default: "balanced",
-    },
-    frameResolution: {
-      type: "number",
-      description: "帧宽度像素（默认 512）",
-      default: 512,
-    },
-    visualPrompt: {
-      type: "string",
-      description: "自定义视觉分析提示词",
-    },
-    visionApiKey: {
-      type: "string",
-      description: "视觉模型 API key（覆盖配置）",
-    },
-    visionModel: {
-      type: "string",
-      description: "视觉模型名称（默认 Qwen/Qwen3.5-397B-A17B）",
-    },
-    visionBaseUrl: {
-      type: "string",
-      description: "视觉 API 基础 URL（默认 SiliconFlow）",
-    },
   },
 };
 

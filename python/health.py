@@ -13,20 +13,25 @@ from typing import Any, Callable
 
 # ── 多后端路由表（v0.3+）──
 # 每个平台配一个"首选 + 备选"列表，失败自动降级
+#
+# ⚠️ 2026-09-26：adapter 名必须是能对上的东西。以前写的是 "xhs_adapter" / "playwright_xhs" /
+#   "weibo_adapter" 这一串 —— 代码里没有这些模块，真实实现全在 adapters/ 下。
+#   而这个字段会原样显示到卡片的「状态」里，名字对不上就等于在给用户编一个不存在的后端。
 _BACKENDS: dict[str, list[dict[str, Any]]] = {
     "bilibili": [
-        {"adapter": "ytdlp", "priority": 0, "online_check": True},
-        {"adapter": "scrapling_api", "priority": 1, "online_check": True},
+        {"adapter": "adapters/bilibili.py + yt-dlp", "priority": 0, "online_check": True},
+        {"adapter": "adapters/bilibili.py（HTTP 兜底）", "priority": 1, "online_check": True},
     ],
     "xhs": [
-        {"adapter": "xhs_adapter", "priority": 0, "online_check": False},
-        {"adapter": "playwright_xhs", "priority": 1, "online_check": False},
+        # 走真浏览器，必须有 cookies（卡片「扫码登录」或 --login xhs）；同文件自带 HTTP 兜底。
+        {"adapter": "adapters/xhs.py（Playwright，需登录）", "priority": 0, "online_check": False},
+        {"adapter": "adapters/xhs.py（HTTP 兜底）", "priority": 1, "online_check": False},
     ],
-    "weibo": [{"adapter": "weibo_adapter", "priority": 0, "online_check": True}],
-    "zhihu": [{"adapter": "zhihu_adapter", "priority": 0, "online_check": True}],
-    "tieba": [{"adapter": "tieba_adapter", "priority": 0, "online_check": True}],
-    "douyin": [{"adapter": "stub", "priority": 0, "online_check": False}],
-    "kuaishou": [{"adapter": "stub", "priority": 0, "online_check": False}],
+    "weibo": [{"adapter": "adapters/weibo.py", "priority": 0, "online_check": True}],
+    "zhihu": [{"adapter": "adapters/zhihu.py", "priority": 0, "online_check": True}],
+    "tieba": [{"adapter": "adapters/tieba.py", "priority": 0, "online_check": True}],
+    "douyin": [{"adapter": "adapters/douyin.py（未完整实现）", "priority": 0, "online_check": False}],
+    "kuaishou": [{"adapter": "adapters/kuaishou.py（未完整实现）", "priority": 0, "online_check": False}],
 }
 
 # 失败计数，临时跳过不可用后端（300 秒冷却）

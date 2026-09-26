@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "bilibili-intake-v2",
   "name": "内容摄取 (Bilibili Intake)",
-  "version": "0.6.35",
-  "description": "多平台内容摄取引擎 —— B站 / 小红书 / 微博 / 知乎 / 贴吧 / 抖音 / 快手。统一搜索、单条/笔记抓取、评论、创作者主页。\n\nB站走 yt-dlp 直连官方字幕（优先中文 AI 字幕、自动回退语言），无字幕时才用 Whisper 兜底转写；另有音频下载、视觉帧分析、知识地图生成。采集可丢后台，长视频不再撞 180 秒上限。\n\n采集产物统一落盘：正文 text.txt、字幕原始文件、artifact.json（kind / anchorKind / 正文 / 锚点 / 资源）、分析报告。长视频按时间轴分段交付，可 anchorOffset 分页续读，不再静默截断。\n\n本地文档走同一条链路：intake_document 支持 PDF / Office / 图片（复用环境里已装好的 doc-intake，带版面提取与 OCR），也支持 txt / md / html / docx / csv / json。\n\n采集过的内容在卡片「记录」里可查、可补写总结，产物路径与正文字数一并落记录；「历史」按 canonical id 去重。",
+  "version": "0.6.66",
+  "description": "多平台内容摄取引擎 —— B站 / 小红书 / 微博 / 知乎 / 贴吧 / 抖音 / 快手，也能读本地文档。正文、字幕、评论统一落盘，在卡片里查看、补写总结。",
   "minAppVersion": "0.942.0",
   "entry": "index.js",
   "icon": "assets/icon.png",
@@ -13,7 +13,8 @@
     "app/tasks.manage",
     "app/session.start-turn",
     "app/models.read",
-    "app/provider.credentials.read"
+    "app/provider.credentials.read",
+    "app/models.infer"
   ],
   "network": {
     "allowedHosts": [
@@ -94,6 +95,12 @@
             "title": "转写设备",
             "description": "auto 优先 GPU，不可用再回退 CPU"
           },
+          "whisperCpuThreads": {
+            "type": "number",
+            "default": 0,
+            "title": "Whisper CPU 线程数",
+            "description": "0 = 自动（核数一半，最少 1）；正数 = 指定线程数；-1 = 不限制（吃满所有核，旧行为）。只影响走 CPU 转写的视频"
+          },
           "whisperLanguage": {
             "type": "string",
             "default": "",
@@ -152,41 +159,62 @@
             "default": 12000,
             "title": "回传正文最大字符数"
           },
+          "ffmpegPath": {
+            "type": "string",
+            "default": "",
+            "title": "ffmpeg 路径",
+            "description": "画面分析用。填 ffmpeg.exe 的绝对路径（例如 W:\\Games\\ffmpeg\\bin\\ffmpeg.exe）；留空则去常见安装位置自己找一遍"
+          },
+          "shotsProfile": {
+            "type": "string",
+            "default": "A",
+            "enum": [
+              "A",
+              "B"
+            ],
+            "title": "帧分析档位",
+            "description": "A = 内容档：语义分段（时间窗 + 场景 + 字幕吸附）+ 每段一张帧，服务总结锚点；B = 镜头语言档：运动量曲线 + 首尾两帧 + 联系表 + 全套质量门（更贵）"
+          },
+          "shotsDownloadVideo": {
+            "type": "boolean",
+            "default": false,
+            "title": "下载原片（帧分析用）",
+            "description": "独立开关，默认关。帧分析需要本地原片；关着时对没有原片的记录会直接拒绝并提示，不会偷偷下载"
+          },
+          "shotsMaxSeconds": {
+            "type": "number",
+            "default": 20,
+            "title": "帧分析分段长度上限（秒）",
+            "description": "档 A 用。段数 ≈ 片长 ÷ 这个值；段数超了下面的上限时会自动把这个窗顶大"
+          },
+          "shotsMaxSegments": {
+            "type": "number",
+            "default": 60,
+            "title": "帧分析段数上限",
+            "description": "档 A 用。段数会超过它时自动把分段长度顶大（上限优先于秒数）。段数 ≈ 一次视觉模型调用，这是成本闸门"
+          },
+          "trashKeepDays": {
+            "type": "number",
+            "default": 30,
+            "title": "删除缓冲保留天数",
+            "description": "启动时按它清一次缓冲（只删不写）。设 0 = 不按时间清"
+          },
+          "trashMaxMB": {
+            "type": "number",
+            "default": 500,
+            "title": "删除缓冲体积上限（MB）",
+            "description": "超了就按最旧的先删。设 0 = 不按体积清。缓冲在 captures/.trash/，卡片「缓冲」tab 可见、可手动清空"
+          },
           "visionEnabled": {
             "type": "boolean",
             "default": false,
             "title": "启用视觉帧分析"
           },
-          "visionBackend": {
-            "type": "string",
-            "default": "siliconflow",
-            "enum": [
-              "siliconflow",
-              "openai",
-              "qwen-local"
-            ],
-            "title": "视觉模型后端"
-          },
-          "visionSiliconflowApiKey": {
-            "type": "string",
-            "default": "",
-            "sensitive": true,
-            "title": "视觉模型 API Key"
-          },
-          "visionModel": {
-            "type": "string",
-            "default": "Qwen/Qwen3.5-397B-A17B",
-            "title": "视觉模型名称"
-          },
-          "visionFrameDetail": {
-            "type": "string",
-            "default": "balanced",
-            "enum": [
-              "efficient",
-              "balanced",
-              "token-burner"
-            ],
-            "title": "帧提取粒度"
+          "summaryAuto": {
+            "type": "boolean",
+            "default": true,
+            "title": "采集后自动写总结"
+            ,"description": "走宿主模型通道生成「一句话 + 要点」，要点会做回指校验；不需要你在对话里说一句话。关掉就回到「要手动发起」的老行为"
           }
         }
       }

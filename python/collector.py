@@ -195,115 +195,6 @@ def _read_cookies_for_request(cookies_file: str) -> str:
 
 
 # ============================================================
-# Visual analysis helper
-# ============================================================
-
-def _run_visual_analysis(args: argparse.Namespace, output_dir: Path, transcript_text: str, video_source: str | None = None) -> dict | None:
-    """Run visual frame analysis on the video (any platform).
-
-    Args:
-        args: CLI arguments
-        output_dir: Output directory for frames and visual analysis files
-        transcript_text: Transcript text (from any platform's audio/subtitles)
-        video_source: Full URL of the video (defaults to args.source normalized)
-
-    Returns:
-        Visual analysis result dict or None on failure
-    """
-    import asyncio
-
-    def _vlog(msg: str) -> None:
-        log(f"[visual] {msg}")
-
-    # Build backend config from args
-    backend_config: dict[str, str] = {}
-    api_key = args.vision_api_key or ""
-    if not api_key:
-        # Try to read from environment
-        import os
-        api_key = os.environ.get("VISION_SILICONFLOW_API_KEY", "")
-    if api_key:
-        backend_config["api_key"] = api_key
-
-    model = args.vision_model or ""
-    if not model:
-        model = "Qwen/Qwen3.5-397B-A17B"
-    backend_config["model"] = model
-
-    base_url = args.vision_base_url or ""
-    if not base_url:
-        base_url = "https://api.siliconflow.cn/v1"
-    backend_config["base_url"] = base_url
-
-    # Determine effective source URL.
-    if video_source is None:
-        video_source = normalize_source(args.source, args.page)
-
-    video_path = None
-    try:
-        # Try B站-style yt-dlp options first (carries the right Origin/Referer),
-        # then fall back to platform-agnostic options if missing.
-        try:
-            from bilibili_pipeline import build_common_ydl_opts
-            opts = build_common_ydl_opts(args.cookies_file, video_source)
-        except Exception:
-            opts = {
-                "noplaylist": True, "quiet": True, "no_warnings": True,
-                "http_headers": {"Referer": video_source, "User-Agent": "Mozilla/5.0"},
-            }
-        opts.update({
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-            "outtmpl": str(output_dir / "visual_video.%(ext)s"),
-            "merge_output_format": "mp4",
-        })
-        if args.cookies_file:
-            opts["cookiefile"] = args.cookies_file
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([video_source])
-
-        # Find the downloaded video file
-        for f in output_dir.glob("visual_video.*"):
-            if f.suffix in (".mp4", ".mov", ".mkv", ".webm"):
-                video_path = f
-                break
-        # If merged, look for the merge output
-        if not video_path:
-            merged = output_dir / "visual_video.mp4"
-            if merged.exists():
-                video_path = merged
-    except Exception as e:
-        _vlog(f"Video download for visual analysis failed: {e}")
-        return {"ok": False, "error": f"Video download failed: {e}"}
-
-    if not video_path or not video_path.exists():
-        return {"ok": False, "error": "No video file available for frame extraction"}
-
-    # Build prompt
-    prompt = args.visual_prompt or (
-        "Analyze this video's visual content. Provide a summary, a timeline of "
-        "key segments with descriptions, notable key moments, any on-screen text, "
-        "and the overall visual style. Respond in JSON format."
-    )
-
-    # Run async analysis
-    from visual_analyzer import run_visual_analysis
-
-    result = asyncio.get_event_loop().run_until_complete(
-        run_visual_analysis(
-            video_path=video_path,
-            output_dir=output_dir,
-            transcript=transcript_text,
-            backend_name=args.vision_backend,
-            backend_config=backend_config,
-            detail=args.frame_detail,
-            resolution=args.frame_resolution,
-            prompt=prompt,
-        )
-    )
-    return result
-
-
-# ============================================================
 # B站 single video pipeline (imports from bilibili_pipeline)
 # ============================================================
 
@@ -362,14 +253,16 @@ def _run_single(args: argparse.Namespace) -> None:
                 #   而且 transcriptSource 仍然报 platform_subtitle——调用方完全看不出来。
                 audio_path = download_audio(source, output_dir, args.audio_format, args.cookies_file)
                 transcript_text, transcribe_device, transcript_segments = transcribe_audio(
-                    audio_path, args.whisper_model, args.whisper_language, args.whisper_device
+                    audio_path, args.whisper_model, args.whisper_language, args.whisper_device,
+                    getattr(args, "whisper_cpu_threads", 0),
                 )
             elif transcript_text != "":
                 pass  # 已有平台字幕，不重复下载音频
             else:
                 audio_path = download_audio(source, output_dir, args.audio_format, args.cookies_file)
                 transcript_text, transcribe_device, transcript_segments = transcribe_audio(
-                    audio_path, args.whisper_model, args.whisper_language, args.whisper_device
+                    audio_path, args.whisper_model, args.whisper_language, args.whisper_device,
+                    getattr(args, "whisper_cpu_threads", 0),
                 )
     except Exception as exc:
         # ⭐ v0.6.21：以前只 log 就吃掉，上层完全看不出来 Whisper 挂了。
@@ -384,15 +277,7 @@ def _run_single(args: argparse.Namespace) -> None:
         comments = fetch_comments(source, args.cookies_file, args.comment_limit,
                                   with_sub_comments=args.with_sub_comments)
 
-    # Step 5.5: Visual analysis (optional, --visual flag)
     visual_result = None
-    if args.visual:
-        try:
-            visual_result = _run_visual_analysis(
-                args, output_dir, transcript_text,
-            )
-        except Exception as e:
-            bili_log(f"Visual analysis failed (non-fatal): {e}")
 
     # Step 6: Build output
     result = {
@@ -456,15 +341,21 @@ def _run_single(args: argparse.Namespace) -> None:
 
     write_json(output_dir / "result.json", result)
 
-    # Generate analysis reports (transcript_analysis.md + visual_analysis.md)
+    # Generate analysis report
+    #   ⭐ 2026-09-26：只出正文报告。视觉报告（visual_analysis.md/html）随旧视觉链路
+    #   （frame_extractor / visual_analyzer）一起下线；画面分析现在走 lib/shots，
+    #   产物落在槽位的 shots/ 下，不再由采集命令顺手写一份。
     try:
-        from report_generator import generate_reports
-        reports = generate_reports(result, output_dir, visual_result)
-        result["reports"] = {
-            "transcript_report": str(reports["transcript_report"]),
-            "visual_report": str(reports["visual_report"]),
-        }
-        log(f"Reports generated: {reports['transcript_report'].name}, {reports['visual_report'].name}")
+        from report_generator import generate_transcript_report
+        report_path = generate_transcript_report(
+            title=result.get("title", ""),
+            uploader=result.get("uploader", ""),
+            duration=result.get("duration") or 0,
+            transcript=result.get("transcriptText", ""),
+            output_dir=output_dir,
+        )
+        result["reports"] = {"transcript_report": str(report_path)}
+        log(f"Report generated: {report_path.name}")
     except Exception as e:
         log(f"Report generation failed (non-fatal): {e}")
 
@@ -841,7 +732,8 @@ def _handle_cookies_cli(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "error": str(e)}))
         return 0
 
-    # logout
+
+    # logout
     if args.logout:
         try:
             removed = store.delete(args.logout)
@@ -959,33 +851,45 @@ def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) ->
         item["textChars"] = len(article_text)
         log(f"article text layer written: {len(article_text)} chars")
 
+    # ⭐ 2026-09-26：小红书视频笔记 —— 把原片下下来，接上帧分析链路。
+    #   地址在 item["video"]["info"]["media"]["stream"] 里（key 是 EF4/EF5 这种编码），
+    #   每路有 masterUrl（带 sign+t 的签名地址）+ backupUrls；取 size 最大的那路。
+    #   ⚠️ 必须带 Referer: https://www.xiaohongshu.com/，否则 CDN 直接 403（实测）。
+    #   文件名固定 source_video.mp4 —— intake_shots 认的就是这个名字。
+    if getattr(args, "download_video", False):
+        try:
+            import urllib.request as _ur
+            _vinfo = (item.get("video") or {}).get("info") or {}
+            _streams = (_vinfo.get("media") or {}).get("stream") or {}
+            _cands = []
+            for _codec, _arr in _streams.items():
+                for _st in (_arr or []):
+                    if _st.get("masterUrl"):
+                        _cands.append((int(_st.get("size") or 0), _st))
+            _cands.sort(key=lambda x: -x[0])
+            if _cands:
+                _size, _best = _cands[0]
+                _dst = output_dir / "source_video.mp4"
+                _req = _ur.Request(_best["masterUrl"], headers={
+                    "Referer": "https://www.xiaohongshu.com/",
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+                })
+                with _ur.urlopen(_req, timeout=120) as _resp:
+                    _data = _resp.read()
+                _dst.write_bytes(_data)
+                item["sourceVideoPath"] = str(_dst)
+                item["sourceVideoBytes"] = len(_data)
+                log("xhs 原片已下载: %d 字节 -> %s" % (len(_data), _dst.name))
+            else:
+                log("没有可下载的视频流（图文 / 文字笔记）")
+        except Exception as _e:
+            item["sourceVideoError"] = str(_e)[:200]
+            log("xhs 原片下载失败: %s" % _e)
     item["outputDir"] = str(output_dir)
     write_json(output_dir / "result.json", item)
 
-    # Visual analysis (any platform) — same pipeline as B站
-    if args.visual:
-        transcript_text = item.get("transcriptText", "") or item.get("description", "")
-        try:
-            visual_result = _run_visual_analysis(args, output_dir, transcript_text, video_source=source)
-            if visual_result:
-                item["visualAnalysis"] = visual_result
-                item["visualOk"] = visual_result.get("ok", False)
-
-                # Generate reports
-                try:
-                    from report_generator import generate_reports
-                    reports = generate_reports(item, output_dir, visual_result)
-                    item["reports"] = {
-                        "transcript_report": str(reports["transcript_report"]),
-                        "visual_report": str(reports["visual_report"]),
-                    }
-                    log(f"Reports generated: {reports['transcript_report'].name}, {reports['visual_report'].name}")
-                except Exception as e:
-                    log(f"Report generation failed (non-fatal): {e}")
-
-                write_json(output_dir / "result.json", item)
-        except Exception as e:
-            log(f"Visual analysis failed (non-fatal): {e}")
+    visual_result = None
 
     print(json.dumps(item, ensure_ascii=False, indent=2))
     return 0
@@ -994,6 +898,58 @@ def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) ->
 # ============================================================
 # Main
 # ============================================================
+
+def _run_download_video(args: argparse.Namespace, output_dir: Path) -> int:
+    """把原片下到 output_dir（帧分析用），写 source_video.<ext>。
+
+    ⭐ 2026-09-26：旧视觉链路里的下载代码随 frame_extractor 一起删了，
+    但“帧分析需要本地原片”这件事还在 —— 所以单独立一个动作，
+    由工具 intake_shots 在开关打开（shotsDownloadVideo）、槽位里又没有原片时调它。
+
+    选择刻意简单：不碰 Node 权限模型（下载跟采集一样在 python 子进程里做），
+    产物就一个文件，路径写回 stdout 的 JSON。
+    """
+    import yt_dlp
+
+    source = normalize_source(args.source, args.page) if args.source else ""
+    if not source:
+        sys.stdout.write(json.dumps({"ok": False, "error": "缺少 --source"}, ensure_ascii=False))
+        return 2
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from bilibili_pipeline import build_common_ydl_opts
+        opts = build_common_ydl_opts(args.cookies_file, source)
+    except Exception:
+        opts = {
+            "noplaylist": True, "quiet": True, "no_warnings": True,
+            "http_headers": {"Referer": source, "User-Agent": "Mozilla/5.0"},
+        }
+    opts.update({
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "outtmpl": str(output_dir / "source_video.%(ext)s"),
+        "merge_output_format": "mp4",
+    })
+    if args.cookies_file:
+        opts["cookiefile"] = args.cookies_file
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([source])
+    except Exception as e:
+        sys.stdout.write(json.dumps({"ok": False, "error": f"下载失败：{type(e).__name__}: {e}"}, ensure_ascii=False))
+        return 1
+
+    found = ""
+    for suffix in (".mp4", ".mkv", ".webm", ".mov"):
+        p = output_dir / f"source_video{suffix}"
+        if p.exists():
+            found = str(p)
+            break
+    sys.stdout.write(json.dumps({
+        "ok": bool(found), "videoPath": found, "outputDir": str(output_dir),
+    }, ensure_ascii=False))
+    return 0 if found else 1
 
 def main() -> int:
     args = parse_args()
@@ -1011,6 +967,8 @@ def main() -> int:
         status = get_routing_status()
         sys.stdout.write(json.dumps(status, ensure_ascii=False, indent=2))
         return 0
+    if args.action == "download-video":
+        return _run_download_video(args, output_dir)
 
     # --- Cookies management ---
     if args.list_logins or args.login or args.logout or args.import_cookies or args.extract_cookies:
@@ -1072,7 +1030,7 @@ def main() -> int:
                 transcript = choose_subtitle_text(subs, args.subtitle_languages)
                 if not args.no_audio and (args.force_transcribe or not transcript):
                     audio = download_audio(tmp_source, tmp_output, args.audio_format, args.cookies_file)
-                    transcript, dev, _segs = transcribe_audio(audio, args.whisper_model, args.whisper_language, args.whisper_device)
+                    transcript, dev, _segs = transcribe_audio(audio, args.whisper_model, args.whisper_language, args.whisper_device, getattr(args, "whisper_cpu_threads", 0))
 
                 # Write transcript text to file
                 if transcript:

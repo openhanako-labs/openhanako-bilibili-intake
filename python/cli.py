@@ -18,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-format", default="mp3")
     parser.add_argument("--whisper-model", default="small")
     parser.add_argument("--whisper-device", default="auto")
+    # ⭐ v0.6.38：CPU 转写的线程数。0 = 自动（核数一半），-1 = 不限制（吃满所有核）。
+    parser.add_argument("--whisper-cpu-threads", type=int, default=0)
     parser.add_argument("--whisper-language", default="")
     parser.add_argument("--subtitle-language", action="append", dest="subtitle_languages", default=[])
     parser.add_argument("--cookies-file", default="")
@@ -35,8 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--action",
         default="",
-        choices=["", "health", "routing-status"],
-        help="特殊操作：health=健康诊断, routing-status=路由状态（默认空=正常采集）",
+        choices=["", "health", "routing-status", "download-video"],
+        help="特殊操作：health=健康诊断, routing-status=路由状态, download-video=把原片下到 --output-dir（帧分析用）；默认空=正常采集",
     )
     parser.add_argument(
         "--platform",
@@ -94,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="删除指定平台的本地 cookies，例：--logout xhs",
     )
     parser.add_argument(
+        "--download-video",
+        action="store_true",
+        help="采集时把原片下下来（当前用于小红书视频笔记，落 output_dir/source_video.mp4）",
+    )
+    parser.add_argument(
         "--list-logins",
         action="store_true",
         help="列出所有已保存 cookies 的平台状态",
@@ -125,50 +132,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sort order: 0=comprehensive(default) 1=most played 2=most clicks 3=newest",
     )
 
-    # --- Visual analysis (Claude Video integration) ---
-    parser.add_argument(
-        "--visual",
-        action="store_true",
-        help="Enable visual frame analysis of video content",
-    )
-    parser.add_argument(
-        "--vision-backend",
-        default="hanako",
-        choices=["hanako", "siliconflow", "openai", "qwen-local"],
-        help="Vision backend (default: hanako — Agent-side, no API call)",
-    )
-    parser.add_argument(
-        "--frame-detail",
-        default="balanced",
-        choices=["efficient", "balanced", "token-burner"],
-        help="Frame extraction detail level (default: balanced)",
-    )
-    parser.add_argument(
-        "--frame-resolution",
-        type=int,
-        default=512,
-        help="Frame width in pixels (default: 512, max: 1998)",
-    )
-    parser.add_argument(
-        "--visual-prompt",
-        default="",
-        help="Custom visual analysis prompt (overrides default)",
-    )
-    parser.add_argument(
-        "--vision-api-key",
-        default="",
-        help="Vision model API key (overrides config/env)",
-    )
-    parser.add_argument(
-        "--vision-model",
-        default="",
-        help="Vision model name (default: Qwen/Qwen3.5-397B-A17B for siliconflow)",
-    )
-    parser.add_argument(
-        "--vision-base-url",
-        default="",
-        help="Vision API base URL (default: https://api.siliconflow.cn/v1)",
-    )
     return parser
 
 

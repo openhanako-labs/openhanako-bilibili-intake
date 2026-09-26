@@ -29,6 +29,15 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
 .top .top-actions button{padding:5px 10px;border:1px solid var(--line-s);border-radius:5px;background:transparent;color:var(--ink-2);font-size:11px;cursor:pointer;font-family:var(--font-ui);transition:all var(--dur);white-space:nowrap}
 .top .top-actions button:hover{background:var(--accent-lt);color:var(--accent);border-color:var(--accent-line)}
 
+.login-bar{display:flex;gap:8px;align-items:center;padding:7px 16px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0;font-size:11.5px}
+.login-bar .login-label{color:var(--ink-3)}
+.login-bar .login-grow{flex:1}
+.login-bar button{padding:4px 10px;border:1px solid var(--line-s);border-radius:5px;background:transparent;color:var(--ink-2);font-size:11.5px;cursor:pointer;font-family:var(--font-ui);transition:all var(--dur)}
+.login-bar button:hover{border-color:var(--accent-line);color:var(--accent)}
+.login-bar button:disabled{opacity:.5;cursor:default}
+.login-bar .ok{color:#3f8f57}
+.login-bar .no{color:var(--ink-3)}
+
 /* ── 采集栏 ── */
 .collect-bar{display:flex;gap:8px;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0;align-items:center;flex-wrap:wrap}
 .platform-select{display:flex;gap:3px;flex-shrink:0}
@@ -81,9 +90,12 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
 .rec:hover{border-color:var(--accent-line);box-shadow:0 1px 6px rgba(74,122,138,.05)}
 .rec-top{display:flex;gap:8px;align-items:flex-start}
 .rec-title{flex:1;font-size:13px;font-weight:500;line-height:1.4;min-width:0}
-.rec-del{flex-shrink:0;padding:2px 6px;border:none;border-radius:4px;background:transparent;color:var(--ink-3);font-size:11px;cursor:pointer;opacity:0;transition:all var(--dur)}
-.rec:hover .rec-del{opacity:1}
-.rec-del:hover{background:rgba(168,85,74,.1);color:var(--err)}
+/* ⭐ W3（2026-09-26）：删除按钮**常显**。旧写法 opacity:0 + `.rec:hover` 才显形——
+   不悬停就等于没有按钮（触屏、或者习惯直接看内容的人根本不知道它在）。
+   用户的原话是「卡片根本没给删除的按钮」。 */
+.rec-del{flex-shrink:0;padding:2px 7px;border:1px solid var(--line-s);border-radius:4px;background:transparent;color:var(--ink-3);font-size:11px;cursor:pointer;transition:all var(--dur)}
+.rec-del:hover{border-color:var(--err);background:rgba(168,85,74,.08);color:var(--err)}
+.rec-del:disabled{opacity:.5;cursor:not-allowed}
 .rec-meta{display:flex;gap:9px;font-size:11px;color:var(--ink-3);margin-top:5px;flex-wrap:wrap;align-items:center}
 .rec-plat{padding:1px 6px;border-radius:3px;background:#E8E0D8;color:var(--ink-2);font-weight:500;font-size:10px}
 .rec-when{margin-left:auto}
@@ -95,6 +107,39 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
 .rec-tags{display:flex;gap:4px;margin-top:7px;flex-wrap:wrap}
 .rec-tags .tag{padding:1px 6px;border-radius:3px;font-size:10px;background:var(--accent-lt);color:var(--accent)}
 .rec-src{font-size:10px;color:var(--ink-3);margin-top:6px;font-family:var(--font-mono);word-break:break-all}
+
+/* ── W3：批量选择 / 两步确认 / 删除缓冲 ── */
+.rec-toolbar{display:flex;gap:8px;align-items:center;margin:0 0 10px}
+.rec-toolbar button{padding:4px 10px;border:1px solid var(--line-s);border-radius:5px;background:transparent;color:var(--ink-3);font-size:11.5px;cursor:pointer;font-family:var(--font-ui);transition:all var(--dur)}
+.rec-toolbar button:hover{border-color:var(--accent-line);color:var(--accent)}
+.rec-toolbar button.danger{border-color:var(--err);background:var(--err);color:#fff}
+.rec-toolbar button.danger:hover{filter:brightness(.94);color:#fff}
+.rec-toolbar .grow{flex:1}
+.rec-toolbar-info{font-size:11.5px;color:var(--ink-3)}
+.confirm-bar{display:flex;gap:9px;align-items:center;padding:9px 11px;margin:0 0 10px;border-radius:6px;background:rgba(168,85,74,.09);border:1px solid rgba(168,85,74,.22)}
+.confirm-bar span{flex:1;font-size:12px;color:var(--ink-2);line-height:1.5}
+.confirm-bar button{padding:3px 11px;border-radius:5px;border:1px solid var(--line-s);background:transparent;color:var(--ink-2);font-size:11.5px;cursor:pointer;font-family:var(--font-ui)}
+.confirm-bar button.danger{border-color:var(--err);background:var(--err);color:#fff}
+.confirm-bar button.danger:hover{filter:brightness(.94)}
+/* ⚠️ 这一行不能删：上面 .confirm-bar 设了 display:flex，作者样式会盖掉浏览器默认的
+   [hidden]{display:none} —— 于是 bar.hidden = true 完全无效，「取消」点了没反应。 */
+.confirm-bar[hidden]{display:none}
+
+/* ── 画面分析报告：先点「报告」，再看弹窗里内嵌的整页报告 ── */
+.modal{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.42)}
+/* ⚠️ 同一个坑：.modal 也设了 display:flex，必须自己把 [hidden] 补回来 */
+.modal[hidden]{display:none}
+.modal-box{width:min(1040px,92vw);height:min(84vh,900px);display:flex;flex-direction:column;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.28)}
+.modal-head{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line-s);font-size:12.5px;color:var(--ink-2)}
+.modal-head span{flex:1}
+.modal-head button{padding:3px 11px;border-radius:5px;border:1px solid var(--line-s);background:transparent;color:var(--ink-2);font-size:11.5px;cursor:pointer;font-family:var(--font-ui)}
+.modal-frame{flex:1;width:100%;border:0;background:#fff}
+.rec-report{padding:2px 9px;border:1px solid var(--line-s);border-radius:4px;background:transparent;color:var(--ink-3);font-size:10.5px;cursor:pointer;font-family:var(--font-ui);flex-shrink:0}
+.rec-report:hover{border-color:var(--accent-line);color:var(--accent)}
+.rec-pick{flex-shrink:0;margin-top:3px;accent-color:var(--accent);cursor:pointer}
+/* ⭐ 2026-09-26：原来只改了个边框颜色，用户根本看不出勾没勾上 —— 删除不可逆，必须一眼可见。 */
+.rec.picked{border-color:var(--accent);background:var(--accent-lt);box-shadow:inset 3px 0 0 var(--accent)}
+.rec.picked .rec-pick{outline:2px solid var(--accent);outline-offset:1px;border-radius:3px}
 
 /* ── 空状态 ── */
 .empty{padding:36px 20px;text-align:center;color:var(--ink-3)}
@@ -150,7 +195,13 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
 .log-line:last-child{border-bottom:none}
 .log-time{color:var(--ink-3);flex-shrink:0}
 .log-msg{color:var(--ink);word-break:break-all}
-</style></head><body>
+</style>  <script>
+    // ⭐ 2026-09-26：宿主把卡片/面板开成独立窗口时，会等这一条 ready 信号。
+    //   没有它 → 窗口永远转圈（图库的 panel.html:20 是同一条约定）。
+    try { (window.parent || window).postMessage({ type: "ready" }, "*"); } catch (e) { /* 不在 iframe 里就算了 */ }
+  </script>
+
+</head><body>
 <div class="app">
 
   <div class="banner"></div>
@@ -164,42 +215,46 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
     </div>
   </div>
 
-  <div class="collect-bar">
-    <div class="platform-select">
-      <button class="on" data-p="bilibili">B站</button>
-      <button data-p="xhs">小红书</button>
-      <button data-p="weibo">微博</button>
-      <button data-p="zhihu">知乎</button>
-      <button data-p="tieba">贴吧</button>
-      <button data-p="douyin">抖音</button>
-      <button data-p="kuaishou">快手</button>
-    </div>
-    <div class="url-input">
-      <input id="url-input" placeholder="粘贴链接或 BV 号，回车采集" autocomplete="off">
-      <button id="btn-capture">采集</button>
-    </div>
-    <span class="status" id="capture-status"></span>
-  </div>
 
-  <div class="search-bar">
-    <input id="search-input" placeholder="关键词搜索…" autocomplete="off">
-    <button id="btn-search">搜索</button>
-    <span class="status" id="search-status"></span>
-  </div>
 
   <div class="tabs">
     <button class="on" data-tab="records">记录<span class="bd" id="rec-count">0</span></button>
-    <button data-tab="capture">采集</button>
-    <button data-tab="search">搜索</button>
     <button data-tab="history">历史</button>
     <button data-tab="logs">日志</button>
     <button data-tab="status">状态</button>
   </div>
 
   <div class="cw"><div class="ct">
-    <div class="tc on" id="tc-records"><div class="status" id="rec-status"></div><div id="records-list"></div></div>
-    <div class="tc" id="tc-capture"><div class="empty"><div class="e-icon">↧</div><div>采集内容后会显示在这里</div><div class="e-sub">链接填上方输入框，支持 BV 号</div></div></div>
-    <div class="tc" id="tc-search"><div class="empty"><div class="e-icon">⌕</div><div>搜索结果会显示在这里</div></div></div>
+    <div class="tc on" id="tc-records">
+      <div class="status" id="rec-status"></div>
+      <div class="rec-toolbar">
+        <button id="btn-bulk" title="勾选多条一起删">批量选择</button>
+        <button id="btn-bulk-del" class="danger" hidden title="删除选中的记录与其本地产物">删除所选</button>
+        <button id="btn-bulk-all" hidden title="勾选当前列出的全部记录">全选</button>
+        <button id="btn-bulk-inv" hidden title="已勾的取消、没勾的勾上">反选</button>
+        <span class="rec-toolbar-info" id="bulk-info"></span>
+        <span class="grow"></span>
+        <input id="rec-filter" type="search" placeholder="过滤记录（标题 / 平台 / 链接 / 总结…）" style="padding:3px 9px;border:1px solid var(--line-s);border-radius:5px;background:transparent;color:var(--ink);font-size:11.5px;font-family:var(--font-ui);min-width:180px">
+        <button id="btn-trash" title="删掉的槽位里，总结文件会留档在这里">缓冲</button>
+        <button id="btn-trash-empty" title="彻底清空缓冲，不可恢复">清空缓冲</button>
+      </div>
+      <div class="confirm-bar" id="confirm-bar" hidden>
+        <span id="confirm-text"></span>
+        <button class="danger" id="confirm-yes">确认删除</button>
+        <button id="confirm-no">取消</button>
+      </div>
+      <!-- 画面分析报告：先点「报告」，再看弹窗里内嵌的整页报告 -->
+      <div class="modal" id="report-modal" hidden>
+        <div class="modal-box">
+          <div class="modal-head">
+            <span id="report-title">画面分析报告</span>
+            <button id="report-close">关闭</button>
+          </div>
+          <iframe id="report-frame" class="modal-frame" sandbox="allow-same-origin" title="画面分析报告"></iframe>
+        </div>
+      </div>
+      <div id="records-list"></div>
+    </div>
     <div class="tc" id="tc-history"><div class="empty"><div class="e-icon">◌</div><div>点击「历史」加载采集记录</div></div></div>
     <div class="tc" id="tc-logs"><div class="empty"><div class="e-icon">⋮</div><div>点击「日志」加载运行日志</div></div></div>
     <div class="tc" id="tc-status"><div class="empty"><div class="e-icon">⚙</div><div>点击"状态"加载</div></div></div>

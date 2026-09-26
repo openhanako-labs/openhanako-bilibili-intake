@@ -425,6 +425,10 @@ def extract_info_via_scrapling(source):
 v2 intake_health          → 200，秒回（不再 30s 超时）
 v2 single 采集 BV1T7YE6JEG9 → 200，8.6s，ok=true，元数据完整
 v2 产物                    → audio_streams / metadata / raw_info / result / visual_analysis ✓
+                              ⚠️ 2026-09-26 起 visual_analysis.* 不再产出 —— 旧视觉链路
+                              （frame_extractor / visual_analyzer / vision_backend）已删，
+                              画面分析改走 lib/shots + 宿主视觉通道，产物是槽位 shots/ 下的
+                              shots.json / frames/ / visual_anchors.json。本行是当时的记录。
 v1 single 采集（同 venv）   → 退出码 0，4.8s，ok=true
 两侧调用期间 pip 进程数      → 0（无重装）
 ```
@@ -1335,180 +1339,16 @@ JS 语法  intake-script.js / intake.js  通过
 - runtime.js:L261 的 `payload.whisperModel || runtime.settings.whisperModel` 在两者都为 undefined 时会传字符串 "undefined" 给 CLI——目前 settings.json 有值所以不触发，但卡片路由改架构时需要注意
 - 平台 stub 标记仍是降透明度 + hover title，没有点击拦截
 
-## v0.6.24 — faster-whisper + runtime.js 保护 + stub 拦截
 
-### 1. faster-whisper 集成
 
-collector.py 的 `transcribe_audio()` 改为优先用 faster-whisper（CTranslate2 后端，速度 4x），没装则回退到 openai-whisper。
 
-```python
-def transcribe_audio(...):
-    try:
-        from faster_whisper import WhisperModel
-        return _transcribe_faster_whisper(...)
-    except ImportError:
-        return _transcribe_openai_whisper(...)
-```
 
-faster-whisper 已安装（`pip install faster-whisper`），CPU 用 int8 精度，CUDA 用 float16。
 
-**效果**：small 模型 18 分钟音频从 6-9 分钟 → 1.5-2.5 分钟。
 
-### 2. runtime.js 保护
 
-`--whisper-model` 和 `--whisper-device` 只在有值时才 push，避免 undefined 被转成字符串 "undefined" 给 CLI。
 
-旧写法：
-```js
-"--whisper-model", payload.whisperModel || runtime.settings.whisperModel,
-```
-
-新写法：
-```js
-const wm = payload.whisperModel || runtime.settings.whisperModel;
-if (wm) args.push("--whisper-model", wm);
-```
-
-### 3. stub 拦截
-
-doCapture 和 doSearch 开头加了检查，点了 douyin/kuaishou 直接提示"后端未实现，无法采集/搜索"，不跑 15 秒。
-
-## v0.6.25 — 卡片历史/日志 tab
-
-### 1. 前端接线
-
-intake.html 加了"历史"和"日志"标签按钮和 tab pane，intake-script.js 加了 `renderHistory()` 和 `renderLogs()` 函数。
-
-历史 tab 显示采集记录（后端 `/intake/history`），日志 tab 显示运行日志（后端 `/intake/logs`）。
-
-### 2. CSS 样式
-
-新增 `.hist-list`、`.hist-item`、`.log-list`、`.log-line` 等样式。
-
-## v0.6.26 — weibo get_comments 实现
-
-### 1. weibo 评论抓取
-
-weibo.py 的 `get_comments()` 从空实现改为调用移动端 API：
-
-```
-https://m.weibo.cn/api/comments/show?id=<status_id>&count=20&offset=<offset>
-```
-
-从 source 提取 status_id（URL 或纯数字），分页获取评论，转换为 CommentNode。
-
-**限制**：需要登录态（cookies），测试时搜索返回 0 条，说明 weibo API 已收紧。
-
-### 2. UI 标注更新
-
-PARTIAL_PLATS 的 title 从"部分支持：能拿元数据，评论功能未实现"改为"部分支持：需要登录态或浏览器，评论功能可能不可用"。
-
-### 3. zhihu/tieba get_comments
-
-保持空实现，注释说明需要登录态。实现需要查 API 文档，工作量大（每个 1-2 小时）。
-
-### 遗留
-
-- weibo get_comments 需要 cookies 才能工作
-- zhihu/tieba get_comments 保持空实现
-- xhs 需要 Playwright（用户之前明确不装）
 
 ---
-
-## v0.6.27（2026-09-22）SSL 证书修复 + 转写失败可观测
-
-### 背景
-
-采 BV1CXet6gE6X（无平台字幕）时，插件返回「B站视频采集完成，字幕来源：none」，
-上层完全看不出来 Whisper 挂了——`audio.mp3` 都已下载（26MB），但转写报
-`SSL: CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`，
-被 Step 4 的 try/except 吞掉后降级。调用方看到的「完成」是个语义错误的成功。
-
-根因：venv 里 `ssl.get_default_verify_paths()` 只看到 `XBL Client IPsec CA`
-（企业自签），不包含 Windows 系统根 CA 仓库。faster-whisper → huggingface_hub
-下载模型时走 httpx → 默认 context 无证书 → 握手失败。
-
-### 1. SSL：Windows 系统 CA 自动加载（v0.6.27 修）
-
-`collector.py` 顶部插一段，在任何下游库 import 之前把
-`ssl.create_default_context` 包一层：
-
-```python
-import ssl
-_orig_create_default_context = ssl.create_default_context
-def _create_default_context_with_system_certs(*args, **kwargs):
-    ctx = _orig_create_default_context(*args, **kwargs)
-    try:
-        ctx.load_default_certs()  # Windows: 从 cert:\localmachine\root 读系统根 CA
-    except Exception:
-        pass
-    return ctx
-ssl.create_default_context = _create_default_context_with_system_certs
-```
-
-顺手把 `certifi.where()` 写进 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` /
-`CURL_CA_BUNDLE` 环境变量兜底。`requirements.txt` 加 `certifi` 显式声明
-（其实 scrapling/requests 已经带了这个依赖，但既然显式用了就要显式写）。
-
-**验证**：同视频重跑，Whisper 正常走完，`transcriptSource: whisper`、
-`transcriptDevice: cpu`、`text.txt` 6.7KB。日志只留一条无害的
-`unauthenticated requests to HF Hub` 提示。
-
-### 2. 转写失败可观测（v0.6.27 修）
-
-旧写法把「音频下载/转写失败」和「本来就没字幕」混成一个 `transcriptSource: "none"`，
-上层无法区分。Step 4 的 try/except 里加 `transcription_error` 捕获，
-`result.json` 加两个字段：
-
-```json
-"audioDownloaded": true,
-"transcriptionError": "LocalEntryNotFoundError: ...",
-```
-
-现在三个状态可区分：
-
-| 情形 | audioDownloaded | transcriptionError | transcriptSource |
-|------|-----------------|--------------------|------------------|
-| 无音频、有字幕 | false | null | platform_subtitle |
-| 无音频、无字幕 | false | null | none |
-| 有音频、转写失败 | **true** | **非空** | **none** ← UI 可显示错误 |
-| 有音频、转写成功 | true | null | whisper |
-
-### 3. UI：红色错误条（v0.6.27 补）
-
-`ui/intake.html` 新增 `.cap-err` 样式（红色左边线，与 `.cap-warn` 同宽同字号，仅颜色区分），
-`ui/intake-script.js` 的 `renderCapture()` 新增一段：
-
-```js
-const transErr = (r.audioDownloaded === true && r.transcriptionError)
-  ? '<div class="cap-err">音频已下载但转写失败：' + esc(String(r.transcriptionError).slice(0, 120)) + '</div>'
-  : "";
-```
-
-拼到 `excerpt` 之后、`transNote` 之前。120 字符截断，避免 SSL stack trace
-把面板冲崩；完整错误在 `result.json` 里。
-
-现在面板上有三层颜色，一眼分出：
-
-| 类型 | class | 颜色 | 触发条件 |
-|------|-------|------|---------|
-| 信息 | `.cap-note` | 青 | 总是（「转写不在本 UI 执行」提示） |
-| 警告 | `.cap-warn` | 珀色 | `transcriptSource === "whisper"` |
-| 错误 | `.cap-err` | 红 | `audioDownloaded && transcriptionError` |
-
-### 4. 没改的部分
-
-- **没把降级改成失败**：无音频时仍能拿到字幕/评论的路径保留，
-  只是把「有音频但转写失败」这条特定失败面暴露出来。
-- **没加 `--strict-transcription` flag**：留一个开关更硬，但会破坏
-  「失败不致命」的整体风格。等真有人撞到再说。
-
-### 5. .xml 字幕（不是 bug，澄清一下）
-
-BV1CXet6gE6X 日志里有 `danmaku detected: subtitle.danmaku.xml`，看起来像
-字幕漏抓。查了 `subtitle_parser.py`：B站 AI 字幕是 `.vtt`，弹幕是 `.xml`，
-两者不能混。`_REAL_SUBTITLE_EXTS` 里 `.xml` 故意没进。
-这个视频确实没有 AI 字幕（yt-dlp 只拿到弹幕），所以走 Whisper 兜底是正确路径。
 
 ## 版本变更记录（2026-09-22 从 manifest.description 迁出）
 
@@ -1644,24 +1484,3 @@ v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采
 - `lib/tasks.js`：`submitBackground` 支持 `deps.startText`，让不同工具能说自己的开场句（之前不管是采集还是生地图一律说“已在后台开始采集”）。
 - 错误改成**抛异常**统一处理：前台 → `toToolError`，后台 → `tasks.fail`（信息不再半路丢掉）。
 - `pipeline.map_to_markdown`：文档/文章素材没有时间轴，剪片段不再渲染 `` `@?` ``（看着像坏掉的跳转）。
-
----
-
-## 变更记录 v0.6.34 → v0.6.35（2026-09-22）· 运行时自愈与采集超时四连修
-
-一次批量采集里全部踩中。前三条是 venv/torch 自愈链的设计缺口，第四条最好复现——**任何无平台字幕的长视频走工具路径必撞**。根因都与 Python 本身无关。
-
-**BUG-1（主因）`isVenvReady` 只看解释器在不在。** `ensurePythonEnvironment` 的就绪判据是 `fileExists(python.exe)`。半成品 venv（上次安装被打断、`site-packages/torch` 缺 `torch_version.py` 的孤儿目录）会让 python.exe 在、但 `import torch` 失败，却被判“就绪”，随后 hash 不匹配触发重装、pip 撞上孤儿目录退出码 1。
-修法：就绪判据升级为**一次真实 `import torch`**（复用 `queryTorchState`）。探活失败 → 不满足 → 走 `installTorch` 的 `pip uninstall torch`（清孤儿）+ 重装，可直接覆盖装成功。
-⚠️ 别改 `isVenvReady` 本身——`queryTorchState` 内部以它为前置，改了会自调用死循环；所以在调用方 `ensurePythonEnvironment` 叠一层 `venvUsable = venvReady && torchState.version`，并把探到的 `torchState` 传进 `isInstallSatisfied` 复用，避免重复 import。
-
-**BUG-2 `TORCH_INSTALL_FAILED` 没被翻译。** `prepareRuntime` 末尾只认出权限类失败（v0.6.5 修过那类），torch 安装失败直接落到兜底句「原生环境不可用 + WSL 兜底未成功」，把排查者引向“Python 装坏了”。而 `details` 里 `venvDir`/退出码/candidate 全在，只是没翻译。
-修法：源头 `installTorch` 抽 `buildTorchInstallFailure()`——message 直接写“删除 `<venv>\Lib\site-packages\torch` 后重试 / 手动 `pip install --index-url .../cpu torch` / 沙箱内失败就去宿主 shell 跑”；`prepareRuntime` 多模式聚合处也加分支认出 `TORCH_INSTALL_FAILED`。单模式的 installTorch 原始错误、多模式的聚合都自带下一步动作，不再有笼统兜底。
-
-**BUG-3 `reused` 自Guard 只护住 legacy。** `resolveRuntimeRoot` 命中 `source:"own"` 时 `reused:false`，自愈照跑撞上 BUG-1/2——守卫防住了“别人的目录”，没防住“自己目录里的历史包”。
-修法：**不改 `reused` 语义**（legacy 在盘外，`existsSync`/`fs` 检查必被 Node 权限模型拒，动了会踩 BUG-3 报告里那个坑）。`own` 命中 `reused:false` 会走完整自愈——BUG-1 探活失败先自动重装修，仍失败由 BUG-2 抛带指令的错误。a+b 由这两条组合覆盖，风险最低。
-
-**BUG-4（最好复现）采集路径从不传 `timeoutMs`。** `tools/bilibili_video_intake.js` → `ingestBilicVideo`/`ingestMulti`（`lib/service.js`）调 `runCollector(runtime, payload)` 全没传 `options.timeoutMs`，于是恒定走 `SPAWN_TIMEOUT_MS=180_000`。`background:true` 只把“等结果”异步化，没拆 spawn 层的墙。而 `http/intake.js` 每条路由都按需传了 `timeoutMs`、`runCollector` 也留了覆盖口——就是采集这条主路漏穿了。
-修法：`lib/service.js` 定义 `COLLECT_TIMEOUT_MS`(前台 30min) / `BACKGROUND_COLLECT_TIMEOUT_MS`(后台 2h)，`collectTimeoutMs(input)` 按 `input.background` 分流，两条采集主路都传。`ingestAction`(health/routing 秒回)保持 180s 不动。
-
-**教训**：路由层记得传超时、工具层忘了传——同一件事在两个入口做了不一样的处理。凡是 `runCollector`/`spawnAndCollect` 这类“默认 180s”的底层能力，**新增调用方时要把“要不要覆盖超时”当成必答题**，而不是可选项。

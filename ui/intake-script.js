@@ -45,15 +45,27 @@ function req(method, p, body) {
 const API = {
   health:  () => req("GET", "/intake/health"),
   routing: () => req("GET", "/intake/routing"),
-  records: () => req("GET", "/intake/records?limit=100"),
+  // ⭐ 2026-09-26：带上服务端给的版本号（rev）。版本没变时后端连 records.json 都不读，
+  //   只回一句 unchanged —— 轮询的绝大部分轮次走的就是这条路。
+  records: (rev) => req("GET", "/intake/records?limit=100" + (rev ? "&rev=" + encodeURIComponent(rev) : "")),
   // ⭐ 2026-09-22：历史里有、记录是 0 时自动回填一次；产物读回也走这里。
   backfill: () => req("POST", "/intake/records/backfill"),
   artifact: (dir) => req("GET", "/intake/artifact?dir=" + encodeURIComponent(dir)),
+  // ⭐ 画面分析报告的整页文件（弹窗内嵌用）。路由侧仍按 captures 边界校验。
+  reportFile: (shotDir) => req("GET", "/intake/artifact?dir=" + encodeURIComponent(shotDir) + "&file=" + encodeURIComponent("report.html")),
   saveRec: (d) => req("POST", "/intake/record", d),
   delRec:  (id) => req("DELETE", "/intake/record/" + encodeURIComponent(id)),
+  // ⭐ W3（2026-09-26）：批量删除 + 删除缓冲。
+  //   delRec 现在也会连本地产物一起删（后端已改），不再是“只删记录”。
+  purgeRec:  (ids) => req("POST", "/intake/records/purge", { ids }),
+  trash:     () => req("GET", "/intake/trash"),
+  emptyTrash:() => req("POST", "/intake/trash/empty"),
   search:  (kw, sort, limit, platform) => req("GET", `/intake/search?keyword=${encodeURIComponent(kw)}&sort=${sort||0}&limit=${limit||10}${platform ? "&platform=" + encodeURIComponent(platform) : ""}`),
   fetch:   (d) => req("POST", "/intake/fetch", d),
   cookies: () => req("GET", "/intake/cookies"),
+  // ⭐ 把所有平台的登录态都收成"粘贴 cookie"这一种形态（扫码在沙箱里不可能通）。
+  importCookies: (platform, text) => req("POST", "/intake/login/import-cookies", { platform, text }),
+  logout: (platform) => req("POST", "/intake/cookies-logout", { platform }),
   // /intake/history（后端 L206）与 /intake/logs（L372）都存在，当前 UI 未用。
   //   保留定义，做「历史 / 日志」tab 时直接用，不用回来加。
   history: () => req("GET", "/intake/history"),
@@ -105,11 +117,52 @@ function applyPlatformUI() {
   if (searchInput) searchInput.placeholder = "在 " + p + " 搜索关键词";
 }
 let pollTimer = null;
+// ⭐ 2026-09-26：轮询的两处省。
+//   ① 数据没变就不重画：把"条数 + 每条 id:updatedAt"当指纹，与上次相同就直接返回，
+//      连 `innerHTML` 都不碰。正常运行下绝大多数轮次都会命中这条。
+//   ② 页面不可见时跳过本轮（卡片切到后台 / 被别的 tab 盖住）。
+let lastRecFingerprint = "";
+// ⭐ 数据本身的版本号（服务端 records.json 的 size:mtimeMs）。同上——没变就别重画。
+let recRev = "";
 // ⭐ 展开状态跨轮询保留。旧写法每次轮询重建 innerHTML，
 //   `clamped` + `data-open="0"` 会把已展开的总结收回去——用户展开一次、15 秒后被收。
 const openSums = new Set();
 // ⭐ 2026-09-22：回填只试一次（记录为空时）。
 let backfillTried = false;
+
+// ⭐ W3（2026-09-26）：批量选择 + 两步确认。
+//   与 openSums 同一个道理：轮询每 15 秒重建列表，选中状态必须存在这个集合里，
+//   不能指望 checkbox 的 DOM 状态能活过一轮。
+let bulkMode = false;
+const pickedIds = new Set();
+let lastItems = [];
+// ⭐ 2026-09-26：记录过滤（用户原话：只能一个个翻）。纯本地筛选，不打后端。
+let recFilter = "";
+
+function updateBulkInfo() {
+  const info = $("#bulk-info");
+  const del = $("#btn-bulk-del");
+  if (info) info.textContent = bulkMode ? (pickedIds.size ? `已选 ${pickedIds.size} 条` : "勾选要删的记录") : "";
+  if (del) del.hidden = !(bulkMode && pickedIds.size > 0);
+}
+
+// 两步确认。不用 window.confirm —— iframe 里未必可用，而且它拦不住手滑。
+let confirmResolve = null;
+function askConfirm(text) {
+  const bar = $("#confirm-bar");
+  const t = $("#confirm-text");
+  if (!bar || !t) return Promise.resolve(false);   // 没确认条就不删
+  t.textContent = text;
+  bar.hidden = false;
+  return new Promise((res) => { confirmResolve = res; });
+}
+function closeConfirm(v) {
+  const bar = $("#confirm-bar");
+  if (bar) bar.hidden = true;
+  const r = confirmResolve;
+  confirmResolve = null;
+  if (r) r(v);
+}
 
 // ── 鉴权状态 ──
 function setAuthStatus() {
@@ -141,17 +194,19 @@ $$(".platform-select button").forEach(b => {
     this.classList.add("on");
     currentPlatform = this.dataset.p || "bilibili";
     applyPlatformUI();
+    refreshLoginState();
   };
 });
 
 // ── 记录 ──
-async function renderRecords() {
+async function renderRecords(force = false) {
   const wrap = $("#records-list");
   if (!wrap) return;
   if (!wrap.dataset.loaded) {
     wrap.innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>加载中…</div></div>';
   }
-  let r = await API.records();
+  // ⭐ force（手动点刷新）时不带 rev，强制后端读完再回列表。
+  let r = await API.records(force ? "" : recRev);
   // ⭐ 2026-09-22：0.6.26 及以前只有卡片侧采集会写 records.json，模型工具侧一个字不写，
   //   于是会出现「历史里有、记录是 0」。这里自愈一次：发现记录为空就从 captures 回填。
   //   每次打开卡片最多试一次（backfillTried），不会反复扫目录。
@@ -163,19 +218,54 @@ async function renderRecords() {
       flash("#rec-status", `已从历史回填 ${bf.created} 条记录（扫描 ${bf.scanned} 个产物目录）`, false);
     }
   }
+  // ⭐ 版本没变：后端没读盘、也没传列表。这一轮到此为止 —— DOM、计数、指纹全都不碰。
+  // ⭐ 2026-09-26：过滤时不能走这个早退 —— 版本没变但用户改了过滤词，列表必须重画。
+  //   force 那条路不带 rev，所以一定会拿到完整列表，不会绕回这里（无递归）。
+  if (r.ok && r.unchanged) {
+    updateBulkInfo();
+    if (recFilter.trim()) renderRecords(true);
+    return;
+  }
+  if (r.ok && r.rev) recRev = r.rev;
+
   const count = $("#rec-count");
   if (count) count.textContent = (r.total || 0);
+
+  // ⭐ 指纹比对：数据没变就别重建 DOM。force=true（手动点刷新）时跳过这层。
+  if (r.ok) {
+    const fp = (r.total || 0) + "|" + (r.items || []).map(x => x.id + ":" + (x.updatedAt || x.createdAt || "")).join(",");
+    if (!force && fp === lastRecFingerprint && wrap.dataset.loaded === "1") {
+      updateBulkInfo();
+      return;
+    }
+    lastRecFingerprint = fp;
+  }
 
   if (!r.ok) {
     wrap.innerHTML = '<div class="empty"><div class="e-icon">!</div><div>读取记录失败：' + esc(r.error) + "</div></div>";
     return;
   }
   const items = r.items || [];
-  if (items.length === 0) {
-    wrap.innerHTML = '<div class="empty"><div class="e-icon">▤</div><div>还没有记录</div><div class="e-sub">采集一条内容会自动落记录；总结由采集后补写</div></div>';
+  lastItems = items;
+  // 匹配范围用整条记录的 JSON 串 —— 标题 / 平台 / 链接 / 总结正文一网打尽，
+  // 不用逐字段维护（字段会变，这个不会）。
+  const _q = recFilter.trim().toLowerCase();
+  const itemsShown = _q ? items.filter((rec) => JSON.stringify(rec).toLowerCase().includes(_q)) : items;
+  {
+    const st = $("#rec-status");
+    if (st) st.textContent = _q ? ("已过滤 " + itemsShown.length + " / " + items.length + " 条") : "";
+  }
+  if (itemsShown.length === 0) {
+    if (_q) {
+      wrap.innerHTML = '<div class="empty"><div class="e-icon">⌕</div><div>没有匹配的记录</div>'
+        + '<div class="e-sub">过滤词：' + esc(recFilter) + '（共 ' + items.length + ' 条，清空过滤框看全部）</div></div>';
+    } else {
+      wrap.innerHTML = '<div class="empty"><div class="e-icon">▤</div><div>还没有记录</div>'
+        + '<div class="e-sub">采集一条内容会自动落记录；总结由采集后补写</div></div>';
+    }
     return;
   }
-  wrap.innerHTML = items.map(rec => {
+  wrap.innerHTML = itemsShown.map(rec => {
     const tags = (rec.tags || []).filter(Boolean).map(t => `<span class="tag">${esc(t)}</span>`).join("");
     const sm = rec.summary || "";
     const long = sm.length > 160;
@@ -184,10 +274,13 @@ async function renderRecords() {
       ? `<div class="rec-summary${long && !isOpen ? " clamped" : ""}">${esc(sm)}</div>` +
         (long ? `<button class="rec-toggle" data-open="${isOpen ? "1" : "0"}" data-id="${esc(rec.id)}">${isOpen ? "收起" : "展开"}</button>` : "")
       : '<div class="rec-nosummary">未写总结</div>';
-    return `<div class="rec">
+    const picked = pickedIds.has(rec.id);
+    return `<div class="rec${bulkMode && picked ? " picked" : ""}">
       <div class="rec-top">
+        ${bulkMode ? `<input type="checkbox" class="rec-pick" data-id="${esc(rec.id)}"${picked ? " checked" : ""} title="选中这条">` : ""}
         <div class="rec-title">${esc(rec.title || rec.source || "(无标题)")}</div>
-        <button class="rec-del" data-id="${esc(rec.id)}" title="删除">✕</button>
+        ${rec.artifactDir ? `<button class="rec-report" data-dir="${esc(rec.artifactDir)}" title="看画面分析报告（弹窗内嵌整页）">报告</button>` : ""}
+         <button class="rec-del" data-id="${esc(rec.id)}" title="删除这条记录与其本地产物">✕</button>
       </div>
       <div class="rec-meta">
         ${rec.author ? '<span>' + esc(rec.author) + "</span>" : ""}
@@ -206,14 +299,38 @@ async function renderRecords() {
     </div>`;
   }).join("");
 
+  // ⭐ W3：删除前先确认。文案里说清“会删什么”与“哪些会留档”，
+  //   不靠一个孤零零的 ✕ 让用户猜它删到哪一层。
   $$(".rec-del", wrap).forEach(b => b.onclick = async (e) => {
     e.stopPropagation();
     const id = b.dataset.id;
+    const rec = (items || []).find(x => x.id === id) || {};
+    const who = (rec.title || rec.source || "这条记录").slice(0, 40);
+    const extra = rec.summary
+      ? "已总结：摘要会留档到删除缓冲。"
+      : (rec.artifactDir ? "本地产物（正文/字幕/帧/原片）会一并删除。" : "这条没有产物目录。");
+    if (!(await askConfirm(`删除「${who}」？${extra}不可恢复。`))) return;
+    b.disabled = true;
     b.textContent = "…";
     const d = await API.delRec(id);
-    if (d.ok) { renderRecords(); flash("#rec-status", "已删除", false); }
-    // ⭐ 失败只写 b.title（悬停才可见），用户点完什么都不看到
-    else { b.textContent = "✕"; b.title = d.error; flash("#rec-status", "删除失败：" + (d.error || ""), true); }
+    if (d.ok) {
+      pickedIds.delete(id);
+      updateBulkInfo();
+      renderRecords();
+      flash("#rec-status", `已删除${d.trashedFiles ? `（留档 ${d.trashedFiles} 项）` : ""}`, false);
+    } else {
+      b.disabled = false;
+      b.textContent = "✕";
+      flash("#rec-status", "删除失败：" + (d.error || ""), true);
+    }
+  });
+
+  // ⭐ W3：批量勾选
+  $$(".rec-pick", wrap).forEach(c => c.onchange = () => {
+    if (c.checked) pickedIds.add(c.dataset.id); else pickedIds.delete(c.dataset.id);
+    const card = c.closest(".rec");
+    if (card) card.classList.toggle("picked", c.checked);
+    updateBulkInfo();
   });
   // 展开 / 收起长总结：默认只露 3 行，避免列表被长总结擑爆
   $$(".rec-toggle", wrap).forEach(b => b.onclick = (e) => {
@@ -231,6 +348,7 @@ async function renderRecords() {
 
 // ── 采集 ──
 async function doCapture() {
+  if (!$("#url-input")) return;   // 卡片已无采集栏
   const src = $("#url-input").value.trim();
   if (!src) return flash("#capture-status", "请输入链接或 BV 号", true);
   // ⭐ stub 平台拦截：避免跑 15 秒才失败
@@ -311,6 +429,7 @@ function renderCapture(r) {
 
 // ── 搜索 ──
 async function doSearch() {
+  if (!$("#search-input")) return;   // 卡片已无搜索栏
   const kw = $("#search-input").value.trim();
   if (!kw) return flash("#search-status", "请输入关键词", true);
   // ⭐ stub 平台拦截：避免跑 15 秒才失败
@@ -354,7 +473,8 @@ async function doSearch() {
       </div>`).join("");
     $$(".sbtn", el).forEach(b => b.onclick = async (e) => {
       e.stopPropagation();
-      $("#url-input").value = b.dataset.src;
+      const _ui = $("#url-input"); if (!_ui) return;   // 卡片已无采集栏
+  _ui.value = b.dataset.src;
       switchTab("capture");
       doCapture();
     });
@@ -419,7 +539,7 @@ async function renderStatus() {
     ["启用平台", s.enabledPlatforms || "—"],
     ["运行模式", s.runtimeMode || "—"],
     ["最大正文", s.maxReturnedTranscriptChars ? s.maxReturnedTranscriptChars + " 字符" : "—"],
-    ["视觉分析", s.visionEnabled ? "已启用 (" + (s.visionModel || "") + ")" : "未启用"],
+    ["视觉分析", s.visionEnabled ? "已启用（宿主视觉通道）" : "未启用"],
   ];
 
   el.innerHTML = `
@@ -571,7 +691,12 @@ async function refreshAll() {
 }
 function startPoll() {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(refreshAll, 15000);
+  pollTimer = setInterval(() => {
+    // ⭐ 卡片不可见时不干活：省一次路由请求，也省一次 DOM 重建。
+    //   iframe 里的 visibilityState 跟随顶层文档。
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    refreshAll();
+  }, 15000);
 }
 
 setAuthStatus();
@@ -582,11 +707,17 @@ $$(".tabs button[data-tab]").forEach(b => b.onclick = () => {
   if (b.dataset.tab === "history") renderHistory();
   if (b.dataset.tab === "logs") renderLogs();
 });
-$("#btn-capture").onclick = doCapture;
-$("#btn-search").onclick = doSearch;
-$("#btn-refresh").onclick = () => { refreshAll(); if ($("#tc-status").classList.contains("on")) renderStatus(); };
-$("#url-input").addEventListener("keydown", e => { if (e.key === "Enter") doCapture(); });
-$("#search-input").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+const _bc = $("#btn-capture"); if (_bc) _bc.onclick = doCapture;   // 卡片已去掉采集栏（功能在会话里做）
+const _bs = $("#btn-search"); if (_bs) _bs.onclick = doSearch;      // 卡片已去掉搜索栏
+// ⭐ 2026-09-26：过滤框接线（防抖 250ms，避免每个字都打一次后端）。
+let recFilterTimer = null;
+$("#rec-filter").oninput = (e) => {
+  recFilter = (e.target && e.target.value) || "";
+  if (recFilterTimer) clearTimeout(recFilterTimer);
+  recFilterTimer = setTimeout(() => renderRecords(true), 250);   // 过滤必须重画，别撞 unchanged 早退
+};
+
+$("#btn-refresh").onclick = () => { renderRecords(true); if ($("#tc-status").classList.contains("on")) renderStatus(); };
 $("#btn-new-rec").onclick = async () => {
   // ⭐ 旧写法 prompt 链只判了第一步：任意后续一步取消（返回 null），
   //   后面的 prompt 仍会连着弹完。而且保存时不带 platform，
@@ -603,6 +734,275 @@ $("#btn-new-rec").onclick = async () => {
   flash("#rec-status", r.ok ? "已记录" : "记录失败：" + (r.error || ""), !r.ok);
   renderRecords();
 };
+$("#btn-trash").onclick = async () => {
+  const t = await API.trash();
+  if (!t.ok) return flash("#rec-status", "读缓冲失败：" + (t.error || ""), true);
+  if (!t.count) return flash("#rec-status", "缓冲是空的", false);
+  const names = (t.items || []).slice(0, 6).map(i => `${i.day}/${i.slot}`).join("、");
+  flash("#rec-status", `缓冲：${t.count} 个槽位的留档（${(t.bytes / 1048576).toFixed(1)} MB）— ${names}${t.count > 6 ? " 等" : ""}`, false);
+};
+$("#btn-trash-empty").onclick = async () => {
+  if (!(await askConfirm("彻底清空删除缓冲？里面的总结留档将不可恢复。"))) return;
+  const d = await API.emptyTrash();
+  flash("#rec-status", d.ok ? `缓冲已清空（${d.removed} 个槽位）` : "清空失败：" + (d.error || ""), !d.ok);
+};
+// ⭐ 2026-09-26：全选 / 反选。
+//   实现上直接 .click() 已有的 checkbox —— 复用现成的 onchange（它负责加进 pickedIds、
+//   切 .picked 类、刷新计数），所以不依赖记录对象里的 id 字段名，也不怕渲染逻辑改动。
+// ⚠️ 2026-09-26：原来写成了 $(".rec-pick") —— 单 $ 是 querySelector，返回的是单个元素，
+//   对它调 .forEach 直接抛 TypeError，于是"点全选完全没反应"。$ 才是 querySelectorAll。
+//   而且这种错 py/JS 语法检查都抓不到，只有真点一下才暴露。
+//   现在改成改集合 + 重渲染（模板会按 pickedIds 决定 checked / .picked），不再依赖 DOM 点击。
+function bulkToggleAll() {
+  lastItems.forEach((it) => pickedIds.add(it.id));
+  updateBulkInfo();
+  renderRecords();
+}
+function bulkInvert() {
+  lastItems.forEach((it) => {
+    if (pickedIds.has(it.id)) pickedIds.delete(it.id); else pickedIds.add(it.id);
+  });
+  updateBulkInfo();
+  renderRecords();
+}
+$("#btn-bulk-all").onclick = bulkToggleAll;
+$("#btn-bulk-inv").onclick = bulkInvert;
+
+$("#btn-bulk").onclick = () => {
+  bulkMode = !bulkMode;
+  if (!bulkMode) pickedIds.clear();
+  $("#btn-bulk").textContent = bulkMode ? "取消选择" : "批量选择";
+  // 全选/反选只在批量模式下出现（非批量模式下它们是噪音）
+  { const x = $("#btn-bulk-all"); if (x) x.hidden = !bulkMode; }
+  { const x = $("#btn-bulk-inv"); if (x) x.hidden = !bulkMode; }
+  updateBulkInfo();
+  renderRecords();
+};
+$("#btn-bulk-del").onclick = async () => {
+  const ids = [...pickedIds];
+  if (!ids.length) return flash("#rec-status", "还没选记录", true);
+  const sumCount = lastItems.filter(x => ids.includes(x.id) && x.summary).length;
+  const extra = sumCount ? `其中 ${sumCount} 条已总结，摘要会留档到缓冲。` : "";
+  if (!(await askConfirm(`删除选中的 ${ids.length} 条记录与其本地产物？${extra}不可恢复。`))) return;
+  const d = await API.purgeRec(ids);
+  if (d.ok) {
+    pickedIds.clear();
+    updateBulkInfo();
+    renderRecords();
+    flash("#rec-status", `已删除 ${d.deleted} 条${d.failed ? `，失败 ${d.failed} 条` : ""}${d.trashedFiles ? `，留档 ${d.trashedFiles} 项` : ""}`, d.failed > 0);
+  } else flash("#rec-status", "批量删除失败：" + (d.error || ""), true);
+};
+$("#confirm-yes").onclick = () => closeConfirm(true);
+$("#confirm-no").onclick = () => closeConfirm(false);
+
+// ── 画面分析报告：点「报告」→ 弹窗里内嵌整页 ──
+//   报告是自包含的单文件 HTML（样式内联），所以用 srcdoc 而不是 iframe src ——
+//   不需要再为它开一条静态路由。
+function openReport(slotDir, title) {
+  const modal = $("#report-modal");
+  const frame = $("#report-frame");
+  const t = $("#report-title");
+  if (!modal || !frame) return;
+  if (t) t.textContent = title || "画面分析报告";
+  modal.hidden = false;
+  const path_ = String(slotDir).replace(/[\\/]+$/, "") + "/shots/report.html";
+  // 先占位，别让人对着白屏猜
+  frame.srcdoc = '<!doctype html><meta charset="utf-8"><body style="font:13px/1.8 system-ui,sans-serif;color:#6c6965;padding:24px">正在读取报告…</body>';
+  __loadReport(String(slotDir).replace(/[\\/]+$/, "") + "/shots", path_);
+}
+
+// ⭐ 2026-09-26：失败**不再自动关窗**。
+//   两个症状两个原因：① req() 遇到非 2xx 会抛，而这里没接 catch —— Promise 断了，
+//   既不关窗也不填内容，就停在白屏；② 走到 !r.ok 的那种才会 closeReport()，看起来像"自己关了"。
+//   现在一律把原因 + 我查的具体路径写进弹窗，让人能自己判断。
+async function __loadReport(shotDir, shownPath) {
+  const frame = $("#report-frame");
+  if (!frame) return;
+  const msg = (head, body) => {
+    frame.srcdoc = '<!doctype html><meta charset="utf-8"><body style="font:13px/1.8 system-ui,sans-serif;color:#1e1d1c;padding:24px">'
+      + '<div style="font-size:14px;margin-bottom:10px">' + head + "</div>"
+      + '<div style="color:#6c6965">' + body + "</div>"
+      + '<div style="color:#9e9b97;margin-top:14px;font-size:12px">我查的是：' + shownPath + "</div>"
+      + "</body>";
+  };
+  let r = null, err = "";
+  try {
+    r = await API.reportFile(shotDir);
+  } catch (e) {
+    err = (e && e.message) || String(e);
+  }
+  if (!r || !r.ok) {
+    msg("这条记录还没有可看的报告",
+        "原因：" + esc(err || (r && r.error) || "未知原因")
+        + "<br>报告由画面分析（intake_shots）生成，落在 &lt;采集目录&gt;/shots/report.html。"
+        + "<br>先对它跑一次画面分析，再点这里。");
+    return;
+  }
+  if (!r.content) {
+    msg("报告文件是空的", "文件存在但内容为 0 字节，可能上次生成被中断了。重新跑一次画面分析即可。");
+    return;
+  }
+  frame.srcdoc = r.content;
+}function closeReport() {
+  const modal = $("#report-modal");
+  if (modal) modal.hidden = true;
+  const frame = $("#report-frame");
+  if (frame) frame.removeAttribute("srcdoc");
+}
+$("#report-close").onclick = closeReport;
+$("#report-modal").onclick = (e) => { if (e.target === $("#report-modal")) closeReport(); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeReport(); });
+
+// 事件代理：记录列表会被整体重建（innerHTML），逐个绑定会在下一轮轮询后失效。
+$("#records-list").addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest(".rec-report");
+  if (!b) return;
+  e.stopPropagation();
+  const rec = b.closest(".rec");
+  const title = rec ? (rec.querySelector(".rec-title") || {}).textContent || "" : "";
+  openReport(b.dataset.dir || "", title.trim());
+});
+
+// ── 扫码登录 ──
+
+let _loginCache = { at: 0, r: null };
+const LOGIN_TTL_MS = 60000;
+
+// 只负责画：把后端回的 logins 列表映射成一行状态。
+function paintLoginState(r) {
+  const el = $("#login-state");
+  if (!el) return;
+  const plat = currentPlatform;
+  const list = Array.isArray(r && r.logins) ? r.logins : [];
+  // logins 里出现这个平台 = 本地有它的 cookies 文件。
+  const hit = list.find((x) => String((x && (x.platform || x.id)) || x || "") === plat);
+  el.textContent = platName(plat) + "：" + (hit ? "已登录" : "未登录");
+  el.className = "status " + (hit ? "ok" : "no");
+}
+
+async function refreshLoginState(force) {
+  if (!$("#btn-login")) return;   // 卡片已无登录条 → 连同轮询一起停掉
+  const el = $("#login-state");
+  const bl = $("#btn-login");
+  const bo = $("#btn-logout");
+  if (!el || !bl || !bo) return;
+  const plat = currentPlatform;
+  bl.disabled = false;   // 粘贴 cookie 对所有平台都成立，不再按 QR 平台禁用
+  bo.disabled = false;
+  if (!SS) { el.textContent = "离线（卡片不在 scoped UI 路径下）"; el.className = "status"; return; }
+  // ⚠️ 这一步后端要 spawn 一次 python（实测冷 1020ms / 热 668ms，和健康探针 5.9s 一个量级）。
+  //   卡片每次打开都问一遍是白花的 —— 60 秒内直接复用上次结果；登录/登出后传 force。
+  const now = Date.now();
+  if (!force && _loginCache.r && now - _loginCache.at < LOGIN_TTL_MS) { paintLoginState(_loginCache.r); return; }
+  el.textContent = "登录态查询中…";
+  el.className = "status";
+  const r = await API.cookies();
+  _loginCache = { at: Date.now(), r };
+  paintLoginState(r);
+}
+
+// ⭐ 2026-09-26：改成无头扫码 —— 二维码显示在卡片里。
+//   原来那条"拉起浏览器窗口再让人去扫"的做法在子进程被隔离的环境里是死的：
+//   窗口起来用户也看不见（实测过）。零窗口的这条路与运行环境无关。
+
+// 把二维码画在卡片里。元素用 JS 建、样式内联 —— 不动 HTML，就少一处会忘的地方。
+
+// 把二维码画进已有的框（幂等：已经有了就只更新 src）。
+
+// 轮询登录状态（后端读 state.json）。约 200 秒后放弃 —— 二维码本身也会过期。
+
+$("#btn-logout").onclick = async () => {
+  const plat = currentPlatform;
+  if (!(await askConfirm("删掉 " + platName(plat) + " 在本地的 cookies？下次采集要重新扫码。"))) return;
+  const r = await API.logout(plat);
+  if (r && r.ok) flash("#login-state", "已登出 " + platName(plat), false);
+  else flash("#login-state", "登出失败：" + ((r && r.error) || ""), true);
+  cookiesStale();
+  await refreshLoginState(true);
+};
+
+// 登录/登出都改了盘上的 cookies，缓存（后端 60s TTL + 我这个 60s）得跟着失效。
+function cookiesStale() {
+  const st = $("#status-panel");
+  if (st) st.dataset.loaded = "";
+}
+
+// ── 手动粘贴登录 cookie（2026-09-26）──
+//
+// 为什么把「扫码登录」换成这个：App 跑在宿主的 Windows 沙箱里，启动不了任何浏览器
+//（直指 exe 被拒、channel 靠注册表读不到、自带 chromium 未安装，批准 runtime 权限也一样）。
+// 所以登录态只有一种形态：你把 cookie 粘进来。全程在 App 内、零窗口、所有平台同一套。
+$("#btn-login").textContent = "粘贴 cookie";
+$("#btn-login").onclick = () => showCookieBox(currentPlatform);
+
+function cookieBoxNode() {
+  let box = document.getElementById("cookie-box");
+  const bar = document.getElementById("btn-login");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "cookie-box";
+    box.style.cssText = "display:flex;flex-direction:column;gap:8px;padding:12px;margin:8px 0;"
+      + "border:1px solid var(--line-s);border-radius:10px;background:var(--card)";
+    const holder = bar && bar.parentElement && bar.parentElement.parentElement;
+    if (holder) holder.insertBefore(box, bar.parentElement.nextSibling);
+  }
+  return box;
+}
+
+function showCookieBox(plat) {
+  const box = cookieBoxNode();
+  if (box.dataset.open === plat) { box.dataset.open = ""; box.style.display = "none"; return; }
+  box.dataset.open = plat;
+  box.style.display = "flex";
+  box.innerHTML = "";
+
+  const how = document.createElement("div");
+  how.style.cssText = "font-size:12px;color:var(--ink-2);line-height:1.6";
+  how.textContent = "把 " + platName(plat) + " 的登录 cookie 粘在下面，两种都行："
+    + "① 浏览器 Console 里 document.cookie 的整串；"
+    + "② 用 Cookie-Editor 之类扩展导出成 JSON 数组（这种更全，含 HttpOnly 的条目）。";
+  box.appendChild(how);
+
+  const ta = document.createElement("textarea");
+  ta.id = "cookie-input";
+  ta.rows = 5;
+  ta.placeholder = "a1=...; web_session=...;  或者  [{\"name\":\"a1\",\"value\":\"...\"}]";
+  ta.style.cssText = "width:100%;box-sizing:border-box;font-family:var(--font-mono);font-size:12px;"
+    + "padding:8px;border:1px solid var(--line-s);border-radius:8px;background:var(--bg);color:var(--ink);resize:vertical";
+  box.appendChild(ta);
+
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:8px;align-items:center";
+  const save = document.createElement("button");
+  save.textContent = "保存登录态";
+  save.style.cssText = "padding:6px 14px;border:1px solid var(--accent-line);border-radius:8px;"
+    + "background:var(--accent-lt);color:var(--ink);cursor:pointer;font-size:12px";
+  const tip = document.createElement("span");
+  tip.id = "cookie-tip";
+  tip.style.cssText = "font-size:12px;color:var(--ink-2)";
+  row.appendChild(save);
+  row.appendChild(tip);
+  box.appendChild(row);
+
+  save.onclick = async () => {
+    const text = (document.getElementById("cookie-input") || {}).value || "";
+    if (!text.trim()) { tip.textContent = "还没有内容"; return; }
+    save.disabled = true;
+    tip.textContent = "保存中…";
+    const r = await API.importCookies(plat, text);
+    save.disabled = false;
+    if (r && r.ok) {
+      tip.textContent = "已保存 " + r.count + " 条（" + (r.names || []).slice(0, 5).join(", ") + "…）";
+      flash("#login-state", platName(plat) + " 登录态已保存", false);
+      await refreshLoginState(true);
+    } else {
+      tip.textContent = "失败：" + ((r && r.error) || "未知原因");
+    }
+  };
+}
+
 refreshAll();
 startPoll();
 applyPlatformUI();
+// 登录态故意延后：它是卡片打开时唯一要 spawn 一次 python 的一步（~1s），别跟首屏抢。
+setTimeout(() => { if (!document.hidden) refreshLoginState(); }, 1500);

@@ -18,6 +18,7 @@ import asyncio
 import re
 import sys
 import time
+import os
 from pathlib import Path
 from typing import Any
 
@@ -119,8 +120,58 @@ class XhsAdapter(PlatformAdapter):
             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
 
+        # ⚠️ 2026-09-26：**必须先把临时目录指到 app-data 里面**，否则宿主沙箱会拒掉整个 launch：
+        #   "BrowserType.launch: Access to this API has been restricted. Use --allow-fs-write to
+        #    manage permissions."（实测：四个候选 exe/channel/bundled 报的是**同一句** ——
+        #    说明不是"哪个浏览器"的问题，而是 Playwright 要往系统临时目录写 profile，
+        #    而沙箱只允许写 app-data。）
+        #   登录那条流程加了这个重定向之后权限报错就消失了 —— 这里是同一个坑，之前漏了。
+        try:
+            _tmp = Path(str(self.cookies_dir)).parent / "py-tmp"
+            _tmp.mkdir(parents=True, exist_ok=True)
+            os.environ["TEMP"] = str(_tmp)
+            os.environ["TMP"] = str(_tmp)
+            os.environ["TMPDIR"] = str(_tmp)
+        except Exception:
+            pass
+
+        # ⭐ 2026-09-26（实证闭环）：宿主的 App 进程带 --permission，而 **Node 会把权限旗标
+        #   注入每个子进程的 NODE_OPTIONS**。Playwright 的 driver 是 Node 进程 → 被限死：
+        #   exe 明明存在也读不到、临时目录也写不了，报
+        #   "BrowserType.launch: Access to this API has been restricted. Use --allow-fs-write..."。
+        #   Python 不在 Node 权限模型里 → 摘掉这个变量，driver 就自由了。
+        #   自检探针实测：同一个沙箱内，pop 掉之后 chromium LAUNCH OK。
+        os.environ.pop("NODE_OPTIONS", None)
         playwright = sync_playwright().start()
-        _BROWSER_INSTANCE = playwright.chromium.launch(headless=True)
+        # ⚠️ 2026-09-26：**必须**指定可执行文件。不指定时 Playwright 会去找自带的
+        #   chromium_headless_shell（本机没装 → "Executable doesn't exist at ...
+        #   chromium_headless_shell-1234\chrome-headless-shell.exe"），而 channel 又靠注册表。
+        #   顺序：系统 Chrome / Edge 的可执行文件 → channel → 自带。
+        _browser = None
+        _errs = []
+        _bases = [os.environ.get("ProgramFiles") or "C:/Program Files", "C:/Program Files (x86)"]
+        _subs = ["Google/Chrome/Application/chrome.exe", "Microsoft/Edge/Application/msedge.exe"]
+        _cands = []
+        for _b in _bases:
+            for _sub in _subs:
+                _p = os.path.join(_b, _sub)
+                if os.path.exists(_p):
+                    _cands.append(("exe", _p))
+        _cands += [("channel", "chrome"), ("channel", "msedge"), ("bundled", None)]
+        for _kind, _val in _cands:
+            try:
+                if _kind == "exe":
+                    _browser = playwright.chromium.launch(headless=True, executable_path=_val)
+                elif _kind == "channel":
+                    _browser = playwright.chromium.launch(headless=True, channel=_val)
+                else:
+                    _browser = playwright.chromium.launch(headless=True)
+                break
+            except Exception as _e:
+                _errs.append(_kind + ":" + str(_val) + " -> " + str(_e)[:120])
+        if _browser is None:
+            raise RuntimeError("浏览器起不来：" + " | ".join(_errs))
+        _BROWSER_INSTANCE = _browser
         _BROWSER_CONTEXT = _BROWSER_INSTANCE.new_context(
             user_agent=user_agent,
             viewport={"width": 1280, "height": 800},
@@ -251,7 +302,14 @@ class XhsAdapter(PlatformAdapter):
         except Exception as exc:
             return {"ok": False, "error": f"browser: {exc}", "platform": "xhs", "needs_login": True}
 
-        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        # ⚠️ 2026-09-26：**别丢掉 xsec_token**。原来一律用 note_id 重建 URL，
+        #   而 xhs 对很多笔记要求带 xsec_token，不带就渲染成"当前笔记暂时无法浏览"，
+        #   正文 / 图片 / 视频全空（实测踩到）。用户给的原链接里本来就有 token，直接用。
+        _src = str(source or "")
+        if _src.startswith("http") and ("xiaohongshu.com" in _src or "xhslink.com" in _src):
+            url = _src
+        else:
+            url = f"https://www.xiaohongshu.com/explore/{note_id}"
         try:
             page_obj.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
@@ -273,7 +331,7 @@ class XhsAdapter(PlatformAdapter):
                 const desc = text($('#detail-desc') || $('.desc') || $('.note-content'));
                 const author = text($('.author .name') || $('.user-info .username') || $('.author-wrapper .name'));
                 const avatar = $('.author img')?.src || $('.user-info img')?.src || '';
-                const pubDate = text($('.date') || $('.publish-date') || time);
+                const pubDate = text($('.date') || $('.publish-date') || $('time'));
                 const likesText = text($('.interaction-info .like-wrapper .count') ||
                                        $('.like-wrapper .count') ||
                                        $$('.interaction-info span')[0]);
@@ -281,11 +339,45 @@ class XhsAdapter(PlatformAdapter):
                 const commentsText = text($$('.interaction-info span')[2]);
                 const images = $$('.carousel-image img, .note-content img').map(img => img.src || img.dataset.src).filter(Boolean);
                 const videoSrc = $('video')?.src || $('source')?.src || '';
-                return {title, desc, author, avatar, pubDate, likesText, collectsText, commentsText, images, videoSrc};
+                // ⭐ 2026-09-26：DOM 的 src 常是 blob:（外面拿不到）。__INITIAL_STATE__ 里
+                //   的 note.video.media 才有真正可下载的签名地址，一并带出来。
+                let videoInfo = null;
+                try {
+                    const _st = window.__INITIAL_STATE__;
+                    const _nd = _st && _st.note && _st.note.noteDetailMap;
+                    const _first = _nd ? Object.values(_nd)[0] : null;
+                    const _v = _first && _first.note && _first.note.video;
+                    if (_v) videoInfo = { media: _v.media || null, consumer: _v.consumer || null, capa: _v.capa || null };
+                } catch (e) { videoInfo = null; }
+                return {title, desc, author, avatar, pubDate, likesText, collectsText, commentsText, images, videoSrc, videoInfo};
             }""")
         except Exception as exc:
             return {"ok": False, "error": f"evaluate: {exc}", "platform": "xhs"}
 
+        # ⭐ 2026-09-26：抓成登录页就**别当数据用**。
+        #   实测（用户当场撞到）：xhs cookie 失效时页面是「手机号登录」，标题被抓成「手机号登录」、
+        #   正文变成 [object Object] —— 结果是一条**看着像采集成功**的垃圾记录。
+        #   宁可明确失败：告诉调用方需要重新登录。
+        _title = str(data.get("title") or "").strip()
+        _desc = str(data.get("desc") or "").strip()
+        _looks_like_login = (
+            (not _title)
+            or ("登录" in _title)
+            or _title.startswith("[object")
+            or ("登录" in _desc)
+            or _desc.startswith("[object")
+        )
+        if _looks_like_login:
+            return {
+                "ok": False,
+                "platform": "xhs",
+                "needs_login": True,
+                "error": (
+                    "小红书返回的是登录页 / 空数据（cookie 已失效）。"
+                    "请在浏览器里登录小红书，然后用 agent 工具导入 cookies："
+                    "bilibili_video_intake(action=importCookies, platform=xhs, importCookies=<导出的 cookie 串>)"
+                ),
+            }
         return {
             "ok": True,
             "platform": "xhs",
@@ -302,7 +394,10 @@ class XhsAdapter(PlatformAdapter):
                 "comments": _parse_count(data.get("commentsText", "0")),
             },
             "images": data.get("images", []),
-            "video": {"url": data.get("videoSrc", "")} if data.get("videoSrc") else {},
+            "video": {
+                "url": data.get("videoSrc", ""),
+                "info": data.get("videoInfo"),
+            },
             "pub_date": data.get("pubDate", ""),
             "url": url,
             "_via": "playwright",
@@ -326,7 +421,14 @@ class XhsAdapter(PlatformAdapter):
             print(f"[xhs-pw] browser init failed: {exc}", file=sys.stderr)
             return []
 
-        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        # ⚠️ 2026-09-26：**别丢掉 xsec_token**。原来一律用 note_id 重建 URL，
+        #   而 xhs 对很多笔记要求带 xsec_token，不带就渲染成"当前笔记暂时无法浏览"，
+        #   正文 / 图片 / 视频全空（实测踩到）。用户给的原链接里本来就有 token，直接用。
+        _src = str(source or "")
+        if _src.startswith("http") and ("xiaohongshu.com" in _src or "xhslink.com" in _src):
+            url = _src
+        else:
+            url = f"https://www.xiaohongshu.com/explore/{note_id}"
         try:
             page_obj.goto(url, wait_until="domcontentloaded", timeout=30000)
             page_obj.wait_for_selector(".comment-item, .comments-container, .interaction-list", timeout=10000)

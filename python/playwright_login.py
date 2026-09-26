@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import urllib.request
 from pathlib import Path
@@ -46,7 +47,23 @@ CDP_TIMEOUT = 10  # seconds to wait for CDP connection
 LOGIN_FLOWS = {
     "xhs": {
         "start_url": "https://www.xiaohongshu.com",
-        "logged_in_check": "() => /a1=|web_session=|webId=/.test(document.cookie)",
+        # ⚠️ 2026-09-26：原来是 /a1=|web_session=|webId=/ —— 但 `a1` 和 `webId` 是小红书
+        #   发给**每个匿名访客**的设备标识，不是登录态。后果：第一次轮询（约 2 秒后）就为真
+        #   → 打印 "login detected!" → 窗口当场关掉 → 把 12 个匿名 cookie 存成"已登录"。
+        #   人眼看到的就是“点了扫码、窗口一闪、什么都没发生”。（这句当时写错了 —— 实测匿名会话也会拿到 web_session，见下面第二版的说明。）
+        # ⚠️ 2026-09-26（第二版）：单看 cookie 都会假阳性 ——
+        #   · `a1` / `webId`：匿名访客就有（实测 10 个 cookie 里就有这两个）
+        #   · `web_session`：非 headless 的匿名会话**也会拿到**，值可能为空
+        #   所以改成两个条件同时成立：web_session 有实质值（>=16 字符）+ 登录弹层不可见。
+        #   实测（headless 匿名会话）：`.login-container` / `.login-modal` 命中，登录后应消失。
+        "logged_in_check": """() => {
+            const c = document.cookie || "";
+            const m = /web_session=([^;]*)/.exec(c);
+            const strong = !!(m && m[1] && m[1].length >= 16);
+            const box = document.querySelector(".login-container, .login-modal");
+            const layerVisible = !!(box && box.offsetParent !== null);
+            return strong && !layerVisible;
+        }""",
         "cookie_domains": ["xiaohongshu.com", "xhslink.com"],
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -185,6 +202,11 @@ async def _do_login_async(
         # === Login flow ===
         print(f"[login:{platform}] navigating to {cfg['start_url']}")
         await page.goto(cfg["start_url"], wait_until="domcontentloaded", timeout=30000)
+        try:
+            # 用户报告过"没弹窗"：至少保证这个窗口不在别的窗口后面。
+            await page.bring_to_front()
+        except Exception:
+            pass
 
         # Wait for the user to scan. We poll for a logged-in signal.
         print(f"[login:{platform}] waiting for QR scan (timeout {timeout_seconds}s)")
@@ -207,7 +229,7 @@ async def _do_login_async(
             try:
                 final_cookies = await context.cookies()
                 login_cookie_names = {
-                    "xhs": {"a1", "web_session", "webId"},
+                    "xhs": {"web_session"},
                     "bilibili": {"DedeUserID", "SESSDATA", "bili_jct"},
                     "weibo": {"SUB", "SUBP", "SUHB"},
                 }.get(platform, set())
@@ -216,7 +238,13 @@ async def _do_login_async(
                     and any(d in c.get("domain", "") for d in cfg["cookie_domains"])
                     for c in final_cookies
                 )
-                if has_login_cookie:
+                if platform == "xhs":
+                    # ⚠️ 2026-09-26：xhs **不走 cookie 兜底**。实测匿名会话的 web_session
+                    #   也有实质长度（>=16）—— 光看 cookie 必然假阳性：这一次脚本等了 35 秒
+                    #   没等到扫码，兜底却把 13 个匿名 cookie 存成"已登录"。
+                    #   是否真登录，只由上面那个复合判定（登录弹层消失）说了算。
+                    has_login_cookie = False
+                elif has_login_cookie:
                     print(f"[login:{platform}] timeout, but login cookies detected — saving anyway")
                     logged_in = True
             except Exception:
@@ -305,3 +333,5 @@ def check_login_status(platform: str, cookies_dir: str | Path) -> dict[str, Any]
     if bundle.user:
         info["user"] = bundle.user
     return info
+
+# ============================================================
