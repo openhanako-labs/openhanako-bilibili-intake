@@ -7,3 +7,4 @@ data/
 _*.mjs
 capture-*.mjs
 *.tmp
+release/
