@@ -1,9 +1,9 @@
 ---
 name: hanako-bilibili-intake
-description: 多平台内容摄取引擎（当前 v0.6.35）—— 从 B站/小红书/微博/知乎/贴吧/抖音/快手/YouTube 采集内容：单条/笔记抓取、搜索、批量、元数据/评论/创作者主页/音频下载/Whisper 转写/视觉帧分析。⚠️ 评论默认就会采集，但不会随返回值回传，采完必须自己读 outputDir/result.json 的 comments[]。本地文件（PDF/Office/图片/txt/md/html/csv/json）请改用 intake_document；写可回指的结构化总结用 intake_summary。触发词：B站视频、BV号、av号、bilibili链接、小红书笔记、微博、知乎、贴吧、抖音、快手、YouTube链接、采集这个视频、提取字幕、转写、总结这个视频、拉评论、看评论。
+description: 多平台内容摄取引擎（当前 v0.6.67）—— 从 B站/小红书/微博/知乎/贴吧/抖音/快手/YouTube 采集内容：单条/笔记抓取、搜索、批量、元数据/评论/创作者主页/音频下载/Whisper 转写/视觉帧分析。⚠️ 评论默认就会采集，但不会随返回值回传，采完必须自己读 outputDir/result.json 的 comments[]。本地文件（PDF/Office/图片/txt/md/html/csv/json）请改用 intake_document；写可回指的结构化总结用 intake_summary。触发词：B站视频、BV号、av号、bilibili链接、小红书笔记、微博、知乎、贴吧、抖音、快手、YouTube链接、采集这个视频、提取字幕、转写、总结这个视频、拉评论、看评论。
 ---
 
-# Hanako Bilibili Intake — 多平台内容摄取（当前 v0.6.35）
+# Hanako Bilibili Intake — 多平台内容摄取（当前 v0.6.67）
 
 一个统一接口吃多平台内容。采集产物统一落盘（`text.txt` + `artifact.json` + 「记录」里一条），
 采集过的内容可补写结构化总结（`intake_summary`），也可生成知识地图（`generate_knowledge_map`）。
@@ -102,4 +102,4 @@ description: 多平台内容摄取引擎（当前 v0.6.35）—— 从 B站/小�
 **默认后台跑**（`background` 默认 true），返回 taskId，完成自动回对话。
 
 ---
-*当前版本 v0.6.35 · 更新 2026-09-22*
+*当前版本 v0.6.67 · 更新 2026-09-28*

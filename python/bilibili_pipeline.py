@@ -341,8 +341,12 @@ def transcribe_audio(audio_path: Path, model_name: str, language: str, device_pr
 
 
 def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str, device_preference: str, WhisperModel, cpu_threads: Any = 0) -> tuple[str, str, list]:
-    """faster-whisper 实现：CTranslate2 后端，速度 4x。"""
-    device = resolve_whisper_device(device_preference)
+    """faster-whisper 实现：CTranslate2 后端，速度 4x。
+
+    ⭐ v0.6.67：device 探测显式传 backend="faster-whisper"，走 ct2 通道，
+    不再被 venv 里 CPU 版 torch 绑架（详见 resolve_whisper_device 的注释）。
+    """
+    device = resolve_whisper_device(device_preference, backend="faster-whisper")
     model_ref = resolve_whisper_model_reference(model_name)
     
     # faster-whisper 用 compute_type 控制精度：
@@ -385,7 +389,7 @@ def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str,
     """openai-whisper 实现（回退路径）。"""
     import whisper
     
-    device = resolve_whisper_device(device_preference)
+    device = resolve_whisper_device(device_preference, backend="openai-whisper")
     model_ref = resolve_whisper_model_reference(model_name)
     model = whisper.load_model(model_ref, device=device)
     
@@ -439,20 +443,65 @@ def resolve_whisper_cpu_threads(preference: Any, device: str) -> int:
     return max(1, cores // 2)
 
 
-def resolve_whisper_device(device_preference: str) -> str:
-    """Resolve device preference to actual device string."""
+def resolve_whisper_device(device_preference: str, backend: str = "openai-whisper") -> str:
+    """Resolve device preference to actual device string.
+
+    ⭐ v0.6.67: **检测 CUDA 的路径随 backend 走**，不再单一依赖 torch。
+
+    背景：faster-whisper 底层是 ctranslate2（ct2），**根本不需要 torch**；但旧实现
+    统一用 `torch.cuda.is_available()` 探 CUDA，导致 v1 遗留 venv（torch 装成 +cpu）
+    把 faster-whisper 也一并钉死在 CPU 上，即使 ct2 的 CUDA 后端完全可用。
+
+    本函数现在的行为：
+      - backend == "faster-whisper"：优先查 ct2，ct2 没 CUDA 才回落查 torch
+      - backend == "openai-whisper"：仍走 torch（这条路径就是 torch 后端的）
+
+    显式 cuda 请求而实际不可用 → 抛错，让调用方看见，而不是静默降级。
+    """
     import torch
 
     pref = device_preference.strip().lower()
+
+    def _cuda_available_via_torch() -> bool:
+        try:
+            return torch.cuda.is_available()
+        except Exception:
+            return False
+
+    def _cuda_available_for(backend: str) -> bool:
+        if backend == "faster-whisper":
+            if ct2_cuda_device_count() > 0:
+                return True
+            # ct2 不带 CUDA 时，某些老 venv 里 torch 也可能提供 CUDA
+            # （不常出现，但保留这一层避免回归）
+        return _cuda_available_via_torch()
+
+    cuda_ok = _cuda_available_for(backend)
+
     if pref == "cuda":
-        if torch.cuda.is_available():
+        if cuda_ok:
             return "cuda"
-        raise RuntimeError("CUDA requested but not available")
+        raise RuntimeError(
+            f"CUDA requested but not available for backend={backend!r} "
+            f"(ct2_devices={ct2_cuda_device_count()}, torch_cuda={_cuda_available_via_torch()})"
+        )
     if pref == "cpu":
         return "cpu"
-    if pref == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return "cpu"
+    # pref == "auto" 或未知值：探测到就 cuda，否则 cpu
+    return "cuda" if cuda_ok else "cpu"
+
+
+def ct2_cuda_device_count() -> int:
+    """ctranslate2 侧的 CUDA 设备数；ct2 不可用或未编译 CUDA 时返回 0。
+
+    ⭐ PyPI 默认 ctranslate2 wheel（Linux / Windows）都带 CUDA 支持，无需从
+    https://github.com/OpenNMT/CTranslate2/releases 手动下。macOS 走 CPU。
+    """
+    try:
+        import ctranslate2
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        return 0
 
 
 def resolve_whisper_model_reference(model_name: str) -> str:

@@ -1,5 +1,12 @@
 yt-dlp
 openai-whisper
+# ⭐ v0.6.67：显式声明 faster-whisper（CTranslate2 后端）。
+#  以前只声明 openai-whisper，faster-whisper 是间接依赖，pip 拿到的 ct2 版本
+#  在环境不同时会漂移。现在把首选后端钉在依赖列表里，让 venv 的 ct2 版本可控。
+#  ctranslate2 的 PyPI 默认 wheel（Linux / Windows）自带 CUDA 支持，无需从
+#  https://github.com/OpenNMT/CTranslate2/releases 手动下载。macOS 走 CPU。
+faster-whisper>=1.2,<2.0
+ctranslate2>=4.8,<5.0
 scrapling[fetchers]
 requests
 playwright

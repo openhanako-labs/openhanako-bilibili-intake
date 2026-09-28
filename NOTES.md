@@ -1484,3 +1484,73 @@ v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采
 - `lib/tasks.js`：`submitBackground` 支持 `deps.startText`，让不同工具能说自己的开场句（之前不管是采集还是生地图一律说“已在后台开始采集”）。
 - 错误改成**抛异常**统一处理：前台 → `toToolError`，后台 → `tasks.fail`（信息不再半路丢掉）。
 - `pipeline.map_to_markdown`：文档/文章素材没有时间轴，剪片段不再渲染 `` `@?` ``（看着像坏掉的跳转）。
+
+---
+
+## 变更记录 v0.6.66 → v0.6.67（2026-09-28）· Whisper 探测走 backend，别再让 torch 绑架 faster-whisper
+
+### 背景
+
+一个 1:11:47 的长视频（BV1PqGHzDEUx）在 CPU 上跑 Whisper，后台跑了约 20 分钟才回传结果。查 health：
+
+```
+runtime.cuda = "cpu", runtime.cuda_available = false
+torch: 2.14.0+cpu   # v1 遗留 venv，装的是 CPU wheel
+ctranslate2: 4.8.2  # 其实自带 CUDA，get_cuda_device_count() == 1
+```
+
+硬件层面 RTX 3060 + 591.86 驱动正常，`nvidia-smi` 报 CUDA 13.1；`ctranslate2` 的 PyPI wheel 在本机 Windows 上**能探测到 1 张 GPU**（`ctranslate2.get_cuda_device_count() == 1`）。Whisper 之所以没走 GPU，不是硬件问题，也不是驱动问题——是**代码里的探测顺序**问题。
+
+### 根因
+
+`python/bilibili_pipeline.py` 里的 `resolve_whisper_device` 无脑调 `torch.cuda.is_available()`。但 faster-whisper 走的是 ctranslate2 后端，**根本不需要 torch**。这条链路的实际状态：
+
+1. v1 期装环境时，`lib/runtime.js` 的 `probeWindowsNvidia` 正则只认 `CUDA Version:`，当前驱动输出里也带这个字段（早期记录里说"驱动输出是 UMD Version"已经过时）——但即便正则匹配对了，v2 的 `reused: true` 分支**不做任何 bootstrap**，venv 里 CPU 版 torch 就一直留着。
+2. `resolve_whisper_device("auto")` 看到 `torch.cuda.is_available() == False` → 返回 `"cpu"`。
+3. `_transcribe_faster_whisper` 拿到 `device="cpu"` → `compute_type="int8"`，faster-whisper 在 ctranslate2 上以 CPU int8 跑。
+4. 结果：ct2 明明有 CUDA 后端，永远用不上。
+
+### 改动
+
+1. **`python/bilibili_pipeline.py`**
+   - `resolve_whisper_device(device_preference, backend="openai-whisper")`：新增 `backend` 参数。faster-whisper 分支优先查 `ctranslate2.get_cuda_device_count()`，ct2 不可用才回落 torch；openai-whisper 分支保留原 torch 探测（那条路径本来就是 torch 后端）。
+   - 新增 `ct2_cuda_device_count()`：try/except 包裹 `import ctranslate2`，返回 0 作为兜底，任何异常都不打断主流程。
+   - `_transcribe_faster_whisper` / `_transcribe_openai_whisper` 各自显式传 backend，注释里说明为什么。
+   - 显式 `cuda` 请求但实际不可用 → 抛 `RuntimeError`，把 ct2 设备数和 torch_cuda 值一起塞进 message，方便用户看到"到底哪一步不通"。以前是静默回落 CPU。
+
+2. **`python/requirements.txt`**
+   - 显式声明 `faster-whisper>=1.2,<2.0` 与 `ctranslate2>=4.8,<5.0`。以前只声明 `openai-whisper`，faster-whisper 是间接依赖，pip 拿到的 ct2 版本会漂移。
+   - 加了一行注释：**PyPI 默认 ctranslate2 wheel（Linux / Windows）自带 CUDA 支持**，无需从 GitHub releases 手动下载。macOS 走 CPU。
+
+3. **`manifest.json`** 版本号 0.6.66 → 0.6.67。
+
+4. **`skills/hanako-bilibili-intake/SKILL.md`** 版本号同步。
+
+### 为什么选它，不选"升级 torch 到 CUDA 版"
+
+升级 torch 是一条**环境层**的临时补丁：改一次 site-packages，`torch.cuda.is_available()` 从 false 变 true，探测自然过。代价是 2GB 下载、覆盖 v1 环境、并且只让本机这台电脑生效——其他用户跑这个 App 时，venv 一样会被装成 CPU 版 torch，还是老样子。
+
+改代码是**代码层**的持久修复：所有 venv、所有用户，只要 ctranslate2 带 CUDA（PyPI 默认就是这样），faster-whisper 就自动走 GPU。openai-whisper 回退路径保留原逻辑，torch 是 CPU 版也没关系。
+
+### 副作用与边界
+
+- **不影响 openai-whisper 回退路径**：`backend="openai-whisper"` 仍走 torch，行为完全不变。
+- **`audio_chunker.py` 无需改动**：它 import `resolve_whisper_device` 后调 `whisper.load_model`，就是 openai-whisper 路径，默认 backend 正好对上。
+- **用户如果 `whisperDevice: "cuda"` 显式请求但环境真的不通**：现在会抛错，把 ct2 与 torch 的实际探测值一起写出来；以前是静默 fallback，用户只会觉得"怎么转写变慢了"。
+- **对已有环境的影响**：venv 里现有的 CPU 版 torch 不用重装，`resolve_whisper_device` 会自动绕过它走 ct2 的 CUDA。requirements.txt 的 hash 变了，v2 首次启动时 `isInstallSatisfied` 会返回 false 触发 `pip install -r requirements.txt`——但 v1 遗留的 `torch-install.json` marker 不存在，实际上 `isInstallSatisfied` 的第一道 `installMarker.version` 门槛就已经 false 了；这个流程原本就要跑。真正需要注意的是：`installTorch` 现在会因为 `cudaVersion="13.1"` 解析出 `cu130` 作为首选候选，尝试 `pip uninstall torch` + `pip install --index-url https://download.pytorch.org/whl/cu130 torch`。cu130 wheel 在 PyTorch 官方源上存在（2.7+ 起有），如果装上则 openai-whisper 路径也走 GPU；如果失败则回落到 `cpu-fallback`，行为与之前一致。
+
+### 验证
+
+本机（RTX 3060 / 591.86 / CUDA 13.1 驱动 / v1 遗留 venv）：
+
+```python
+from bilibili_pipeline import resolve_whisper_device, ct2_cuda_device_count
+ct2_cuda_device_count()                                    # → 1
+resolve_whisper_device("auto", backend="faster-whisper")  # → "cuda"
+resolve_whisper_device("auto", backend="openai-whisper")  # → "cpu"  （torch 是 +cpu）
+resolve_whisper_device("cuda", backend="faster-whisper")  # → "cuda"
+resolve_whisper_device("cpu",  backend="faster-whisper")  # → "cpu"
+```
+
+对同一段音频，faster-whisper small/float16 在 RTX 3060 上应能比 CPU/int8 快一个数量级；后续长视频采集（比如 1 小时上下的教程）应该从 CPU 的十几分钟量级压到几分钟。
+
