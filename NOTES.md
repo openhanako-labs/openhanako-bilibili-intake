@@ -1554,3 +1554,121 @@ resolve_whisper_device("cpu",  backend="faster-whisper")  # → "cpu"
 
 对同一段音频，faster-whisper small/float16 在 RTX 3060 上应能比 CPU/int8 快一个数量级；后续长视频采集（比如 1 小时上下的教程）应该从 CPU 的十几分钟量级压到几分钟。
 
+
+---
+
+## 变更记录 v0.6.67 → v0.6.68（2026-10-04）· 评论接口 + 自动总结的调用范围
+
+两个都是「看起来在工作、其实一直没工作」的 bug。共同点：**失败的形状和成功一模一样**，
+所以从返回值里看不出来。
+
+### A. 评论永远只有 3 条
+
+/x/v2/reply 已被 B 站废弃：不管带不带 cookie，都只回 3 条，而 `data.page.count`
+照样报 13 —— 返回 code=0，形状完整，唯一异常是条数。本机实测（2026-10-04 上午）：
+
+```text
+老接口 /x/v2/reply        无 cookie → 3 条    带全部 cookie → 3 条   （page.count 却报 13）
+新接口 /x/v2/reply/wbi/main + WBI 签名
+        无 cookie         → 20 条/页，cursor.all_count=184111，翻页正常
+        只带 buvid3       → 3 条，is_end=true，all_count=4      ← 截断
+        只带 b_nut        → 10 条  /  只带 sid → 10 条
+        全量浏览器 cookie → 3 条   /  去掉 buvid3 → 20 条/页
+```
+
+**`buvid3` 是充分截断条件**，登录态（SESSDATA / DedeUserID / bili_jct）单独带是安全的。
+于是 `cookies_store.py` / `lib/settings.js` 里那句「评论卡在**未登录**的 3 条上限」
+整个方向反了：不是登录不够，是设备指纹 cookie 太多。这两处注释已就地纠正（旧的因果
+关系是巧合，解密该修仍然要修，但评论条数不再靠它）。
+
+改动：
+
+- 新增 `python/bilibili_comments.py` —— 评论取数的唯一入口（WBI 签名 + 游标翻页 +
+  cookie 净化 + aid 解析）。以前 collector.py（urllib）和 adapters/bilibili.py（httpx）
+  各有一份，接口一变两边同时烂，这就是收敛成一份的理由。
+- 翻页换成 `cursor.pagination_reply.next_offset` → `pagination_str={"offset":…}`。
+  只传 `next` 不灵（next=0 和 next=1 返回同一页）；游标失效时 B 站会重发同一页，
+  所以按 rpid 去重，否则原地打转。
+- **二级评论不换接口**：`/x/v2/reply/reply` 实测仍是 20 条/页、count 准确，
+  而它没有 wbi/main 变体（404）。顺手修了「该不该补拉二级」的判据 —— 以前看的是
+  整个视频的评论总数，等于每条根都去打一次子接口；现在看这条根自己的 `rcount`，
+  并且给 12 次的预算上限。
+- `collector.fetch_comments_via_api` 多接 `cookies_dir`；两条来源（.txt / .json）
+  取到之后一律过 `sanitize_cookie_header`。
+
+实测（真实网络）：`BV18TbZ6REyp` 10 条一级 + 3 条二级（以前 3）；
+`av170001` 60 条一级、去重后仍 60（以前 3）。
+
+### B. 卡片「不会显示总结后的内容」
+
+根因不显示在卡片上，只出现在宿主日志里，从 2026-09-26 起每一条都是同一句：
+
+`App invocation expired or belongs to another App`
+
+22 条记录里 21 条 `summary` 是空串，卡片于是整齐地显示「未写总结」——
+**总结不是没写，是每一次都写失败了，而且失败从没被说出来**。
+
+宿主的模型通道契约写明了原因：**「调用范围来自有效 callToken 或本应用的活动 taskId；
+两者都不传时明确归属 App 自己」**。而 09-26 的形态是「采集请求一返回就
+`void autoSummarize(...)`」——请求一返回，invocation 就被回收，后台 promise 再打
+`ctx.models.*` 没有归属。另外 `lib/register-tools.js` 一直把宿主给的
+`context`（含 callToken）脱手丢掉，所以工具侧也从来没有可用凭证。
+
+两个事实决定修法：
+
+- `ctx.models.stream()` **吃** `taskId`（契约原文：A durable task owned by this App.
+  The host validates ownership before use.）；
+- `ctx.models.list()` **不吃任何参数** —— 取模型清单必须还在调用窗口里。
+
+于是分三条路，各按自己的窗口长短走（`lib/summary-task.js`）：
+
+| 来源 | 形态 |
+|---|---|
+| 工具前台 | execute 未返回，窗口是活的 → **await** 就地跑，回执里是真结果不是 `{pending:true}` |
+| 工具后台 `background:true` | 趁窗口内先把模型挑好递进去（`lib/tasks.js`），再挂在活动任务上跑 |
+| 卡片路由 / 卡片「补写总结」 | 30s 封顶等不起 → 建一个 `scope:"app"` + `delivery:"none"` 的持久任务，出窗后带它的 `taskId` 跑，跑完自己结掉 |
+
+同时把状态做成可见的：记录新增 `summaryStatus`（pending / ok / failed / no-text /
+skipped）与 `summaryNote`，卡片按它说话，不再只有一句「未写总结」。
+`POST /intake/summarize`（按 recordId 或 slot）给补写入口，卡片每条未总结的记录一个
+「补写总结」按钮，批量模式加「补写所选」。
+**已有总结的记录不给重写按钮** —— `lib/records.js` 里「手写总结优先级最高」是明写的
+规则，卡片不该提供一键把它盖掉的入口。
+
+实测（重载后真实跑）：
+
+```text
+11:26:25  自动总结完成：…p_1789286333121（要点 8 · 回指 8）   ← 这条链路第一次成功
+          记录：summaryStatus=ok, summaryPoints=8, summaryGrounded=8
+11:27:39  自动总结未完成：…p_1791084447540（没有可用正文（既没锚点也没 text.txt））
+          记录：summaryStatus=no-text —— 同一个失败，现在有了名字和位置
+```
+
+### 关于「App invocation expired」的判断依据
+
+这条错误文本既不在 `app-host-entry.js` 也不在 `hana-server.exe` 的明文字节里，
+反推不到实现。所以定性靠两样：宿主文档 `APPS.md` 的「模型推理」小节写明的范围规则，
+和「同步 await 的调用（hanako-gallery 识图）能成、fire-and-forget 的（本 App 自动总结）
+全灭」这个对照组。修法因此是同时改两处（出窗 + 凭证），而不是猜一个参数。
+
+### 文件
+
+- 新增 `python/bilibili_comments.py`、`lib/summary-task.js`、`tests/test_bilibili_comments.py`
+- 改 `python/collector.py`、`python/adapters/bilibili.py`、`python/cookies_store.py`（注释纠正）
+- 改 `lib/model-host.js`（list/stream 接 callToken+taskId，空值不传）、`lib/auto-summary.js`
+  （挑模型可外供、recordId 显式传、区分 no-text）、`lib/tasks.js`、`lib/service.js`、
+  `lib/settings.js`（注释纠正）、`http/intake.js`、`index.js`、`ui/intake*.js|html`
+- `manifest.json` 0.6.68；能力位没新增（app/tasks.manage + app/models.infer 早就声明过）
+
+### 回归测试
+
+`python tests/test_bilibili_comments.py` —— 10 项，离线（在 `get_json` 那层挂假响应），
+不打真实网络。断言里有一条专门钉死这次的 bug：**任何请求都不许命中 /x/v2/reply**。
+
+### 仍然待办
+
+- 历史里还有 12 条「采到了但没总结」的记录，卡片上逐条/批量点「补写总结」即可回填
+  （会真的发模型调用，没有自动替用户花）。
+- `register-tools.js` 仍然把宿主的 `context`（含 callToken）丢掉。现在这条不需要了，
+  但以后想让 App 借用会话范围的模型配额时，得把它接出来。
+- 其他平台的 `get_comments` 仍是空实现（xhs 除外）。

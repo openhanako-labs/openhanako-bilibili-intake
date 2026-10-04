@@ -165,7 +165,9 @@ def build_common_ydl_opts(cookies_file: str, source: str = "") -> dict[str, Any]
     if cookies_file:
         # yt-dlp 会把本次会话收到的新 cookie **写回** cookiefile。
         # 直接指用户那一份的话，一次采集就会把 SESSDATA 换成匿名 cookie，
-        # 之后评论永远卡在未登录的 3 条上限。这里先拷一份到 temp，只读原件。
+        # 登录态就此丢掉。（旧注释说“之后评论永远卡在未登录的 3 条上限”—— 2026-10-04
+        # 实测：评论只给 3 条是因为 /x/v2/reply 废弃了，与登录无关；见 bilibili_comments.py。
+        # 但保留只读副本这件事仍然必要，只是理由换成了「别把用户的登录态弄脏」。）
         opts["cookiefile"] = _read_only_cookies_copy(cookies_file)
     return opts
 

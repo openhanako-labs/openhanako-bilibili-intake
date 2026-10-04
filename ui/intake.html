@@ -104,6 +104,13 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
 .rec-toggle{margin-top:4px;padding:2px 9px;border:1px solid var(--line-s);border-radius:4px;background:transparent;color:var(--ink-3);font-size:10.5px;cursor:pointer;font-family:var(--font-ui);transition:all .12s}
 .rec-toggle:hover{border-color:var(--accent-line);color:var(--accent)}
 .rec-nosummary{font-size:11px;color:var(--ink-3);margin-top:7px;font-style:italic}
+/* ⭐ 2026-10-04：总结状态分四种说得出口，不再一律“未写总结” */
+.rec-sum-pending{font-size:11px;color:var(--ink-3);margin-top:7px;font-style:italic}
+.rec-sum-fail{font-size:11px;color:var(--err);margin-top:7px;line-height:1.5;word-break:break-word}
+.rec-summarize{margin-left:6px;padding:1px 8px;border:1px solid var(--line-s);border-radius:4px;background:transparent;color:var(--ink-3);font-size:10.5px;cursor:pointer;font-family:var(--font-ui);transition:all .12s}
+.rec-summarize:hover{border-color:var(--accent-line);color:var(--accent)}
+.rec-summarize:disabled{opacity:.55;cursor:default}
+.tag-warn{background:rgba(168,85,74,.12)!important;color:var(--err)!important}
 .rec-tags{display:flex;gap:4px;margin-top:7px;flex-wrap:wrap}
 .rec-tags .tag{padding:1px 6px;border-radius:3px;font-size:10px;background:var(--accent-lt);color:var(--accent)}
 .rec-src{font-size:10px;color:var(--ink-3);margin-top:6px;font-family:var(--font-mono);word-break:break-all}
@@ -229,6 +236,7 @@ body{font-family:var(--font-ui);font-size:13px;color:var(--ink);background:var(-
       <div class="status" id="rec-status"></div>
       <div class="rec-toolbar">
         <button id="btn-bulk" title="勾选多条一起删">批量选择</button>
+<button id="btn-bulk-sum" hidden title="给选中的记录逐条提交总结任务（已有总结的跳过）">补写所选</button>
         <button id="btn-bulk-del" class="danger" hidden title="删除选中的记录与其本地产物">删除所选</button>
         <button id="btn-bulk-all" hidden title="勾选当前列出的全部记录">全选</button>
         <button id="btn-bulk-inv" hidden title="已勾的取消、没勾的勾上">反选</button>

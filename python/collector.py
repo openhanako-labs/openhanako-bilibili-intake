@@ -275,7 +275,8 @@ def _run_single(args: argparse.Namespace) -> None:
     comments = []
     if args.with_comments:
         comments = fetch_comments(source, args.cookies_file, args.comment_limit,
-                                  with_sub_comments=args.with_sub_comments)
+                                  with_sub_comments=args.with_sub_comments,
+                                  cookies_dir=args.cookies_dir)
 
     visual_result = None
 
@@ -430,44 +431,98 @@ def _parse_api_comment(node: dict, level: int = 0, max_depth: int = 3,
     return comment
 
 
+def _cookies_header_for_comments(cookies_file: str, cookies_dir: str = "") -> str:
+    """评论请求的 cookie 头：先取文件，再取统一存储里那一份，最后统一净化。
+
+    为什么要两个来源：B 站单视频管道以前只看 --cookies-file（那张 Netscape 表），
+    而卡片「粘进去」的登录态落的是 <dataDir>/cookies/bilibili.json。两份都带 buvid3，
+    带哪份都会被砍到 3 条 —— 所以取完必须过 sanitize。
+    """
+    header = _read_cookies_for_request(cookies_file) if cookies_file else ""
+    if not header and cookies_dir:
+        try:
+            data = json.loads((Path(cookies_dir) / "bilibili.json").read_text(encoding="utf-8"))
+            header = "; ".join(
+                f"{c.get('name')}={c.get('value') or ''}"
+                for c in (data.get("cookies") or []) if c.get("name"))
+        except Exception:
+            header = ""
+    try:
+        from bilibili_comments import sanitize_cookie_header
+        return sanitize_cookie_header(header)
+    except Exception:
+        return header
+
+
 def fetch_comments_via_api(source: str, cookies_file: str = "", limit: int = 50,
-                           with_sub_comments: bool = True) -> list[dict]:
+                           with_sub_comments: bool = True,
+                           cookies_dir: str = "") -> list[dict]:
+    # ⭐ 2026-10-04：接口层抽到 bilibili_comments.py，这里只剩「原始节点 → dict」。
+    #   换接口的原因写在那文件的头部注释里，一句话：/x/v2/reply 已经废弃，
+    #   不管带不带 cookie 都只给 3 条；而 /x/v2/reply/wbi/main 一旦带上 buvid3
+    #   同样被砍到 3 条 —— 两个坑叠在一起，才造成「09-26 之后全 3 条」。
+    #   sort=2（热度）对应新接口的 mode=3。
     aid = _extract_aid(source)
     if not aid:
         return []
+    cookie = _cookies_header_for_comments(cookies_file, cookies_dir)
+
+    resolved: int | None = None
     if aid.upper().startswith("BV"):
-        av = _bv_to_av(aid)
-        if av:
-            aid = av
-    oid_match = re.search(r"av(\d+)", aid)
-    if not oid_match:
+        resolved = _resolve_aid_number(aid, cookie)
+    else:
+        m = re.search(r"av(\d+)", aid)
+        resolved = int(m.group(1)) if m else None
+    if not resolved:
         return []
-    oid = oid_match.group(1)
-    # 用 /x/v2/reply 而不是已废弃的 medialist/content：
-    # 实测 medialist 返回非 JSON（code=None），reply 接口正常且无需 WBI 签名。
-    # sort=2 = 按热度（与 adapters/bilibili.py 一致）；单页上限 20，需分页。
-    # _parse_api_comment 取的是 member.uname / content.message，本就匹配 reply 的形状。
-    #
-    # 关键坑：接口在空页/末页会把 "replies" 字段置为 null（键存在、值为 None）。
-    # 此时 .get("replies", []) 拿不到默认值，返回 None，后面 for 循环就炸。
-    # 必须用 `or []` 而不能靠 .get 的默认值。
+
+    try:
+        from bilibili_comments import fetch_root_comments, fetch_sub_comments
+    except Exception as exc:  # 模块缺失（老装包 / 打包漏文件）要说出来，别静默回旧接口
+        log(f"[comments] bilibili_comments 不可用，评论将为空: {exc}")
+        return []
+
+    nodes = fetch_root_comments(resolved, limit=limit, cookies=cookie)
     comments: list[dict] = []
-    pn, ps = 1, 20
-    while len(comments) < limit:
-        want = min(ps, limit - len(comments))
-        data = _call_api(
-            f"https://api.bilibili.com/x/v2/reply?type=1&oid={oid}&sort=2&pn={pn}&ps={want}",
-            cookies_file)
-        body = data.get("data") if isinstance(data, dict) else None
-        replies = (body or {}).get("replies") or []
-        for reply in replies:
-            parsed = _parse_api_comment(reply, with_sub_comments=with_sub_comments)
-            if parsed:
-                comments.append(parsed)
-        if not replies or len(comments) >= limit:
-            break
-        pn += 1
+    sub_budget = 12          # 每条根一次请求，别为了二级评论把接口打成连击
+    for node in nodes:
+        parsed = _parse_api_comment(node, with_sub_comments=with_sub_comments)
+        if not parsed:
+            continue
+        comments.append(parsed)
+        # 二级评论：只在这条根自己报了 rcount、且内联没给全时才补拉。
+        # 以前这里判的是「整视频评论总数 > 0」，等于每条都去打一次子接口。
+        if with_sub_comments and sub_budget > 0:
+            rcount = int(node.get("rcount") or 0)
+            inline = len(parsed["replies"])
+            if rcount > inline:
+                sub_budget -= 1
+                parsed["replies"] = [
+                    c for c in (
+                        _parse_api_comment(sub, level=1, max_depth=1,
+                                           with_sub_comments=False)
+                        for sub in fetch_sub_comments(resolved, node.get("rpid"),
+                                                      cookies=cookie)
+                    ) if c
+                ]
     return comments[:limit]
+
+
+def _resolve_aid_number(ident: str, cookies: str = "") -> int | None:
+    """BV / av → 数字 aid。拿不到就 None（评论放弃，主流程不受影响）。"""
+    try:
+        from bilibili_comments import resolve_aid
+        return resolve_aid(ident, cookies=cookies)
+    except Exception:
+        pass
+    # 兜底：旧的裸 view 接口
+    data = _call_api(f"https://api.bilibili.com/x/web-interface/view?bvid={ident}")
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        try:
+            return int(data["data"].get("aid") or 0) or None
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def fetch_comments_via_ytdlp(source: str, cookies_file: str = "") -> list[dict]:
@@ -496,10 +551,11 @@ def fetch_comments_via_ytdlp(source: str, cookies_file: str = "") -> list[dict]:
 
 
 def fetch_comments(source: str, cookies_file: str = "", limit: int = 50,
-                   with_sub_comments: bool = True) -> list[dict]:
+                   with_sub_comments: bool = True, cookies_dir: str = "") -> list[dict]:
     try:
         comments = fetch_comments_via_api(source, cookies_file, limit,
-                                          with_sub_comments=with_sub_comments)
+                                          with_sub_comments=with_sub_comments,
+                                          cookies_dir=cookies_dir)
         if comments:
             return comments[:limit]
     except Exception:
@@ -732,8 +788,10 @@ def _handle_cookies_cli(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "error": str(e)}))
         return 0
 
-
-    # logout
+
+
+    # logout
+
     if args.logout:
         try:
             removed = store.delete(args.logout)

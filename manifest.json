@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "bilibili-intake-v2",
   "name": "内容摄取 (Bilibili Intake)",
-  "version": "0.6.67",
+  "version": "0.6.68",
   "description": "多平台内容摄取引擎 —— B站 / 小红书 / 微博 / 知乎 / 贴吧 / 抖音 / 快手，也能读本地文档。正文、字幕、评论统一落盘，在卡片里查看、补写总结。",
   "minAppVersion": "0.942.0",
   "entry": "index.js",

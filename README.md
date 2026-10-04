@@ -40,8 +40,36 @@ bilibili_video_intake({ logout: "xhs" })                       # 清掉某平台
 
 - `summary.json` / `summary.md` 落在槽位目录，统计与一句话回写到记录（卡片直接显示）
 - 走**宿主模型通道**（能力位 `app/models.infer`），不需要 API key
-- **后台跑**，不占采集的返回时间（宿主对 App 路由有 30s 封顶）
 - 设置项 `summaryAuto`，默认开；关掉即回到「要手动发起」
+
+### 它跑在哪（这一段是踩过坑之后写死的）
+
+宿主对模型调用的原话：**「调用范围来自有效 callToken 或本应用的活动 taskId」**。
+两个事实把可行的形态钉住了：
+
+- `ctx.models.stream()` **吃** `taskId`；
+- `ctx.models.list()` **不吃任何参数** —— 取清单必须还在调用窗口里。
+
+所以：
+
+| 调用来源 | 怎么跑 |
+|---|---|
+| 工具前台 | `execute` 未返回，invocation 是活的 → **await** 就地跑，回执给真结果 |
+| 工具后台 `background:true` | 趁窗口内先把模型挑好递进去；总结挂在这个活动任务上跑 |
+| 卡片路由 / 卡片「补写总结」 | 30s 封顶等不起 → 建一个 `scope:"app"` 的持久任务，出窗后带它的 `taskId` 跑，跑完自己结掉 |
+
+曾经在这三条上都栽过同一个坑：采集请求一返回就 `void autoSummarize(...)`，
+invocation 已被回收，于是**每一次**自动总结都报
+`App invocation expired or belongs to another App`（2026-09-26 到 10-04，
+日志 13 条、22 条记录里 21 条没总结，全部是这个原因）。
+细节写在 `lib/summary-task.js` 的头部注释。
+
+### 卡片上的总结状态
+
+`summaryStatus` / `summaryNote` 会回写到记录，卡片按它说话，不再只有一句「未写总结」：
+`pending`（总结中）/ `ok` / `failed`（带原因）/ `no-text`（没正文可总结）/ `skipped`。
+没有总结的记录给一个「补写总结」按钮，批量模式下可「补写所选」。
+已有总结的记录**不给重写按钮** —— 手写总结优先级最高（`lib/records.js` 里就这么定的）。
 
 ## 小红书（重要）
 

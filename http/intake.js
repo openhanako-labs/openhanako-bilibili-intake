@@ -176,23 +176,29 @@ export default function (app, ctx) {
       // ⭐ 2026-09-26：采集完**自动**写总结（用户原话「要自动」）。
       //   形态：走宿主模型通道（app/models.infer），不往对话里插消息、不需要用户在场；
       //   产物与助手写的完全同源（summary.json + 记录回写）。
-      //   为什么是后台跑（不 await）：宿主对 App 路由有 30s 封顶，而模型一次要几十秒 ——
-      //   等它就会把「采集成功」变成「请求超时」。后台跑完，卡片 15s 轮询自然就把总结显示出来。
+      //   ⭐ 2026-10-04：不再自己 `void` 后台 promise，改提交给宿主的 App 任务通道。
+      //   原因：后台 promise 跑起来时这次请求的 invocation 已经被回收，模型通道按
+      //   「有效 callToken 或本应用活动 taskId」认范围 —— 两者都拿不到，于是
+      //   每一次自动总结都死在 `App invocation expired or belongs to another App`（日志里 13 条，
+      //   21/22 条记录没总结就是这么来的）。现在交给一个 scope:"app" 的持久任务，
+      //   后台带着它的 taskId 打模型通道。细节见 lib/summary-task.js。
       //   关掉它：设置 summaryAuto = false。
       if (body.autoSummary !== false && mode !== "batch" && result?.title) {
         try {
           const { getSettings } = await import("../lib/settings.js");
           const settings = await getSettings(ctx);
           if (settings.summaryAuto) {
-            const { autoSummarize } = await import("../lib/auto-summary.js");
+            const { submitAutoSummary } = await import("../lib/summary-task.js");
             const slotDir = result.outputDir || outputDir;
-            result.autoSummary = { pending: true };
-            void autoSummarize(ctx, { slotDir })
-              .then((r) => {
-                ctx.log?.info?.(`自动总结${r?.ok ? "完成" : "未完成"}：${slotDir}`
-                  + (r?.ok ? `（要点 ${r.counts?.total ?? 0} 个 · 回指 ${r.counts?.grounded ?? 0}）` : `（${r?.reason || r?.error || "未知原因"}）`));
-              })
-              .catch((e) => ctx.log?.warn?.("自动总结异常", { error: e?.message || String(e) }));
+            // submitAutoSummary 自己带退路：建不上任务也会就地试一次，并把状态写进记录。
+            const t = await submitAutoSummary(ctx, {
+              slotDir,
+              recordId: result.savedRecordId || "",
+              title: result.title,
+            });
+            result.autoSummary = t.ok
+              ? { pending: true, taskId: t.taskId }
+              : { pending: true, inline: true, note: t.error };
           } else {
             result.autoSummary = { skipped: true, reason: "设置里关了「采集后自动写总结」" };
           }
@@ -201,6 +207,53 @@ export default function (app, ctx) {
         }
       }
       return c.json(result);
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 给已有记录补写 / 重试总结（2026-10-04）──
+  //
+  // 为什么需要这个入口：卡片以前对「没总结」只做一件事 —— 显示「未写总结」。
+  //   但实际有三种不同的情：从没跑过 / 跑了但模型通道拒了（invocation 过期）/
+  //   根本没正文可总结。对用户都是四个字，对排障完全无用。
+  //   这个入口把「重跑一次」交给用户，同时把失败原因写回记录（summaryNote），
+  //   下次卡片就能说清楚是哪一种。
+  // body: { recordId } 或 { slot }（captures 下的目录名 / 完整路径）
+  app.post("/intake/summarize", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const { submitAutoSummary, markSummary } = await import("../lib/summary-task.js");
+      const { readRecords, sameDirPath } = await import("../lib/records.js");
+
+      const all = readRecords(ctx);
+      let rec = null;
+      if (body.recordId) rec = all.find((r) => r.id === body.recordId) || null;
+      if (!rec && body.slot) {
+        const want = String(body.slot).replace(/[\\/]+$/, "");
+        const full = want.includes("\\") || want.includes("/")
+          ? want : path.join(dataDir, "captures", want);
+        rec = all.find((r) => r.artifactDir && sameDirPath(r.artifactDir, full)) || null;
+      }
+      if (!rec) return c.json({ ok: false, error: "找不到这条记录" }, 404);
+
+      const slotDir = String(rec.artifactDir || "").trim();
+      if (!slotDir || !fs.existsSync(slotDir)) {
+        // 没产物就没法总结（老记录只存了摘要文本，没落过槽位）。
+        markSummary(ctx, { recordId: rec.id, slotDir, status: "no-text", note: "这条记录没有本地产物目录，正文已不在，无法补写总结" });
+        return c.json({ ok: false, error: "这条记录没有本地产物目录，无法补写总结", recordId: rec.id });
+      }
+
+      const job = { slotDir, recordId: rec.id, title: rec.title || "" };
+      // submitAutoSummary 自带退路：建不上任务也会就地试一次，并把结果写回记录。
+      // 所以这里不管哪种情都回 ok —— 区别只在跑在哪条路上。
+      const t = await submitAutoSummary(ctx, job);
+      return c.json({
+        ok: true,
+        recordId: rec.id,
+        pending: true,
+        taskId: t.taskId || undefined,
+        inline: !t.ok,
+        note: t.ok ? undefined : t.error,
+      });
     } catch (e) { return fail(c, e); }
   });
 

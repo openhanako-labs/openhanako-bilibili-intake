@@ -54,6 +54,9 @@ const API = {
   // ⭐ 画面分析报告的整页文件（弹窗内嵌用）。路由侧仍按 captures 边界校验。
   reportFile: (shotDir) => req("GET", "/intake/artifact?dir=" + encodeURIComponent(shotDir) + "&file=" + encodeURIComponent("report.html")),
   saveRec: (d) => req("POST", "/intake/record", d),
+  // ⭐ 2026-10-04：补写 / 重试总结。以前卡片对「没总结」只会写四个字，
+  //   既看不出是没跑过、还是跑了但模型通道拒了，也没入口重跑。
+  summarize: (d) => req("POST", "/intake/summarize", d),
   delRec:  (id) => req("DELETE", "/intake/record/" + encodeURIComponent(id)),
   // ⭐ W3（2026-09-26）：批量删除 + 删除缓冲。
   //   delRec 现在也会连本地产物一起删（后端已改），不再是“只删记录”。
@@ -142,8 +145,12 @@ let recFilter = "";
 function updateBulkInfo() {
   const info = $("#bulk-info");
   const del = $("#btn-bulk-del");
-  if (info) info.textContent = bulkMode ? (pickedIds.size ? `已选 ${pickedIds.size} 条` : "勾选要删的记录") : "";
-  if (del) del.hidden = !(bulkMode && pickedIds.size > 0);
+  const sum = $("#btn-bulk-sum");
+  const on = bulkMode && pickedIds.size > 0;
+  if (info) info.textContent = bulkMode ? (pickedIds.size ? `已选 ${pickedIds.size} 条` : "勾选要删 / 要补总结的记录") : "";
+  if (del) del.hidden = !on;
+  // ⭐ 2026-10-04：批量补总结。历史里 22 条只有 1 条有总结，一条条点不现实。
+  if (sum) sum.hidden = !on;
 }
 
 // 两步确认。不用 window.confirm —— iframe 里未必可用，而且它拦不住手滑。
@@ -270,10 +277,42 @@ async function renderRecords(force = false) {
     const sm = rec.summary || "";
     const long = sm.length > 160;
     const isOpen = openSums.has(rec.id);
-    const summary = sm
-      ? `<div class="rec-summary${long && !isOpen ? " clamped" : ""}">${esc(sm)}</div>` +
-        (long ? `<button class="rec-toggle" data-open="${isOpen ? "1" : "0"}" data-id="${esc(rec.id)}">${isOpen ? "收起" : "展开"}</button>` : "")
-      : '<div class="rec-nosummary">未写总结</div>';
+    // ⭐ 2026-10-04：总结不再只有「未写总结」一种说法。
+    //   后端现在把状态写回记录（summaryStatus / summaryNote），四种情况分开讲：
+    //   pending 后台跑着 / failed 跑挂了（带原因）/ no-text 没正文 / 真的从没跑过。
+    //   后三种都给一个入口，不然用户只能重跑整次采集。
+    const st = String(rec.summaryStatus || "");
+    const note = String(rec.summaryNote || "").trim();
+    let summary = "";
+    let statusChip = "";
+    if (sm) {
+      summary = `<div class="rec-summary${long && !isOpen ? " clamped" : ""}">${esc(sm)}</div>` +
+        (long ? `<button class="rec-toggle" data-open="${isOpen ? "1" : "0"}" data-id="${esc(rec.id)}">${isOpen ? "收起" : "展开"}</button>` : "");
+      statusChip = '<span class="tag" title="总结已回写这条记录">已总结</span>';
+    } else if (st === "pending") {
+      summary = '<div class="rec-sum-pending">总结中…（后台任务，完成会自动回到这条记录）</div>';
+      statusChip = '<span class="tag" title="任务通道里排队或执行中">总结中</span>';
+    } else if (st === "failed") {
+      summary = '<div class="rec-sum-fail" title="' + esc(note) + '">总结失败：' + esc(note || "未知原因") + "</div>";
+      statusChip = '<span class="tag tag-warn" title="' + esc(note) + '">总结失败</span>';
+    } else if (st === "no-text") {
+      summary = '<div class="rec-nosummary">没有可总结的正文' + (note ? "：" + esc(note) : "") + "</div>";
+      statusChip = '<span class="tag" title="采集只拿到元数据，没拿到正文">无正文</span>';
+    } else if (st === "skipped") {
+      summary = '<div class="rec-nosummary">未自动总结' + (note ? "：" + esc(note) : "") + "</div>";
+      statusChip = '<span class="tag" title="' + esc(note) + '">未总结</span>';
+    } else {
+      summary = '<div class="rec-nosummary">未写总结</div>';
+      statusChip = '<span class="tag" title="采集到了但还没跑过总结">未总结</span>';
+    }
+    // 只给「没总结」的记录开口子：已有总结的不提供重写 ——
+    //   records.js 里「手写总结优先级最高」是明写的规则，卡片不该再给一个
+    //   一键拿模型结果把它盖掉の按钮。
+    const canRetry = Boolean(rec.artifactDir) && !sm && st !== "pending";
+    if (canRetry) {
+      summary += `<button class="rec-summarize" data-id="${esc(rec.id)}"` +
+        ` title="让后台重跑一次总结（走任务通道，不卡在界面上）">补写总结</button>`;
+    }
     const picked = pickedIds.has(rec.id);
     return `<div class="rec${bulkMode && picked ? " picked" : ""}">
       <div class="rec-top">
@@ -287,8 +326,9 @@ async function renderRecords(force = false) {
         ${rec.durationSec ? '<span>' + fmtDur(rec.durationSec) + "</span>" : ""}
         <span class="rec-plat">${esc(platName(rec.platform))}</span>
         ${rec.kind ? '<span class="tag" title="素材类型（artifact.json 的 kind）">' + esc({ video: "视频", article: "文章", document: "文档" }[rec.kind] || rec.kind) + "</span>" : ""}
-        <span class="tag" title="${sm ? "已回写总结" : "采集到了但还没写总结；用模型工具写完后回写这条记录"}">${sm ? "已总结" : "未总结"}</span>
+        ${statusChip}
         ${rec.transcriptChars ? '<span title="采集到的正文字符数">' + rec.transcriptChars + " 字</span>" : ""}
+        ${rec.commentCount ? '<span title="采到的评论数（一级评论条数）">评论 ' + esc(rec.commentCount) + "</span>" : ""}
         ${rec.summaryPoints ? '<span class="tag" title="结构化摘要：要点数与回指校验结果（回指不到 = 可能编的）">要点 ' + rec.summaryPoints + (rec.summaryUngrounded ? " · 未回指 " + rec.summaryUngrounded : " · 已全部回指") + "</span>" : ""}
         <span class="rec-when" title="最近更新">${fmtAgo(rec.updatedAt || rec.createdAt)}</span>
       </div>
@@ -342,6 +382,26 @@ async function renderRecords(force = false) {
     b.dataset.open = open ? "0" : "1";
     b.textContent = open ? "展开" : "收起";
     if (open) openSums.delete(id); else openSums.add(id);
+  });
+
+  // ⭐ 2026-10-04：补写 / 重试总结。提交完不等结果（模型一次几十秒，等它会把卡片钉住），
+  //   先把按钮收成「已排队」，15s 轮询会把 pending → ok 带回来。
+  $$(".rec-summarize", wrap).forEach(b => b.onclick = async (e) => {
+    e.stopPropagation();
+    const id = b.dataset.id;
+    const was = b.textContent;
+    b.disabled = true;
+    b.textContent = "提交中…";
+    const r = await API.summarize({ recordId: id });
+    if (r.ok) {
+      b.textContent = r.pending ? "已排队" : "已提交";
+      flash("#rec-status", "总结任务已提交，写完会自动回到这条记录", false);
+      setTimeout(() => renderRecords(true), 1500);
+    } else {
+      b.disabled = false;
+      b.textContent = was;
+      flash("#rec-status", "补写总结失败：" + (r.error || ""), true);
+    }
   });
   wrap.dataset.loaded = "1";
 }
@@ -791,6 +851,31 @@ $("#btn-bulk-del").onclick = async () => {
     renderRecords();
     flash("#rec-status", `已删除 ${d.deleted} 条${d.failed ? `，失败 ${d.failed} 条` : ""}${d.trashedFiles ? `，留档 ${d.trashedFiles} 项` : ""}`, d.failed > 0);
   } else flash("#rec-status", "批量删除失败：" + (d.error || ""), true);
+};
+
+// ⭐ 2026-10-04：批量补写总结。历史里 22 条只有 1 条有总结（自动总结从未成功过），
+//   一两条点得完，二十多条不可能。已有总结的跳过，不拿旧摘要去占模型调用。
+$("#btn-bulk-sum").onclick = async () => {
+  const ids = [...pickedIds];
+  if (!ids.length) return flash("#rec-status", "还没选记录", true);
+  const targets = lastItems.filter(x => ids.includes(x.id) && !x.summary);
+  const skipped = ids.length - targets.length;
+  if (!targets.length) return flash("#rec-status", `选中的 ${ids.length} 条都已经有总结了`, true);
+  const btn = $("#btn-bulk-sum");
+  btn.disabled = true; btn.textContent = "提交中…";
+  let queued = 0, failed = 0, lastErr = "";
+  for (const rec of targets) {
+    const r = await API.summarize({ recordId: rec.id });
+    if (r.ok) queued++; else { failed++; lastErr = r.error || ""; }
+  }
+  btn.disabled = false; btn.textContent = "补写所选";
+  flash("#rec-status",
+    `已提交 ${queued} 条总结任务` + (skipped ? `（跳过已有总结 ${skipped} 条）` : "")
+    + (failed ? `，失败 ${failed} 条：${lastErr}` : ""),
+    failed > 0);
+  pickedIds.clear();
+  updateBulkInfo();
+  setTimeout(() => renderRecords(true), 1500);
 };
 $("#confirm-yes").onclick = () => closeConfirm(true);
 $("#confirm-no").onclick = () => closeConfirm(false);

@@ -157,7 +157,13 @@ class CookieStore:
 # 解完必须剥掉。实测所有 bilibili cookie 都是 32 字节（不是 16/24/40），
 # 且不同 cookie 行之间前缀内容可不同，所以只能按固定长度切，不能按内容识别。
 # 来源：与系统 Python 直接解 AES-GCM 对比，剥 32 后 SESSDATA / DedeUserID /
-# buvid3 / _uuid 全部与预期完全一致，B 站评论接口从 3 条跳到 20 条/页。
+# buvid3 / _uuid 全部与预期完全一致。
+#
+# ⚠️ 2026-10-04 纠正一句旧结论：以当时把「剥完前缀评论从 3 条跳到 20 条/页」当成
+#   解密问题的证据。相关性是真的，因果不是 —— 后来实测：评论接口 /x/v2/reply 已经
+#   废弃，带不带 cookie、解得对不对都只回 3 条；换成 /x/v2/reply/wbi/main 之后，
+#   反而是**带着 buvid3 会被砍回 3 条**，剔掉才拿得到 20 条/页。
+#   解密该修仍然要修（别的接口吃这个），但评论条数不再靠它 —— 见 bilibili_comments.py。
 _CHROME_PLAINTEXT_PREFIX_LEN = 32
 
 _BROWSER_PATHS_WIN = {
@@ -254,8 +260,10 @@ def _chrome_decrypt_value(encrypted_value: bytes, key: bytes | None) -> str:
             # Chrome 在把值加密前会先拼上一段 32 字节的「不透明前缀」
             # （v10 格式的实测行为，与 app-bound encryption 的回退相关）。
             # 不剥掉的话，前 32 字节全是二进制噪声，会把整个 cookie 头弄脏，
-            # 导致 B 站这类 API 直接 HTTP 400。实测：剥掉之后 bilibili
-            # 评论接口从 3 条（未登录天花板）跳到 20 条/页。
+            # 导致 B 站这类 API 直接 HTTP 400。
+            # ⚠️ 这里以前写的实测结论是「剥完 bilibili 评论从 3 条（未登录天花板）跳到
+            #   20 条/页」，那句已作废：评论只给 3 条不是登录问题，是 /x/v2/reply 废弃了；
+            #   新接口上 buvid3 还会反向砍条数。见 python/bilibili_comments.py 头部。
             plaintext = plaintext[_CHROME_PLAINTEXT_PREFIX_LEN:]
             return plaintext.decode("utf-8", errors="ignore")
         except Exception as exc:

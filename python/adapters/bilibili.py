@@ -241,76 +241,49 @@ class BilibiliAdapter(PlatformAdapter):
         max_depth: int = 3,
         with_sub_comments: bool = True,
     ) -> list[CommentNode]:
-        # 解析 aid
+        # ⭐ 2026-10-04：取数抽到 bilibili_comments.py，与 collector.py 共用一份。
+        #   以前这里直接打 /x/v2/reply（已废弃，恒定只回 3 条），而且把 load_cookies()
+        #   里的 buvid3 全量带走 —— 新接口同样会被砍回 3 条。两个坑叠在一起。
+        #   翻页也从 pn 换成 cursor.pagination_reply.next_offset（B 站新游标语义）。
+        from bilibili_comments import fetch_root_comments, fetch_sub_comments
+
         aid = self._extract_aid(source)
         if not aid:
             return []
 
-        cookies = self.load_cookies()
-        headers = {
-            "Referer": f"https://www.bilibili.com/video/{source}",
-            "Origin": "https://www.bilibili.com",
-        }
-
-        all_comments: list[CommentNode] = []
-        pn = 1
-        ps = 20  # API 上限
-
-        while len(all_comments) < limit:
-            data = http_get_json(
-                "https://api.bilibili.com/x/v2/reply",
-                params={
-                    "type": 1,
-                    "oid": aid,
-                    "sort": 2,  # 2 = 按热度
-                    "pn": pn,
-                    "ps": min(ps, limit - len(all_comments)),
-                },
-                cookies=cookies,
-                headers=headers,
-            )
-            if not isinstance(data, dict) or data.get("code") != 0:
-                break
-
-            root = data.get("data") or {}
-            replies = root.get("replies") or []
-            if not replies:
-                break
-
-            for r in replies:
-                node = self._parse_comment(r, level=0, max_depth=max_depth, with_sub_comments=with_sub_comments)
-                if node is None:
-                    continue
-                # 拉二级评论（如 with_sub_comments）
-                if with_sub_comments and node.replies == [] and (root.get("page") or {}).get("count", 0) > 0:
-                    node.replies = self._fetch_sub_comments(aid, node.rpid, max_depth=max_depth)
-                all_comments.append(node)
-                if len(all_comments) >= limit:
-                    break
-
-            page_info = root.get("page") or {}
-            total = page_info.get("count", 0) or 0
-            if pn * ps >= total:
-                break
-            pn += 1
-
-        return all_comments[:limit]
+        cookie = self.cookie_header()   # 净化在 bilibili_comments 里面统一做
+        raws = fetch_root_comments(aid, limit=limit, cookies=cookie)
+        nodes: list[CommentNode] = []
+        sub_budget = 12
+        for raw in raws:
+            node = self._parse_comment(raw, level=0, max_depth=max_depth,
+                                       with_sub_comments=with_sub_comments)
+            if node is None:
+                continue
+            if with_sub_comments and sub_budget > 0:
+                rcount = int(raw.get("rcount") or 0)
+                if rcount > len(node.replies):
+                    sub_budget -= 1
+                    for sub in fetch_sub_comments(aid, node.rpid, cookies=cookie):
+                        child = self._parse_comment(sub, level=1, max_depth=max_depth,
+                                                    with_sub_comments=False)
+                        if child:
+                            node.replies.append(child)
+            nodes.append(node)
+        return nodes[:limit]
 
     def _fetch_sub_comments(self, aid: int, rpid: int, *, max_depth: int) -> list[CommentNode]:
-        """Fetch level-2 comments for a given root comment."""
-        cookies = self.load_cookies()
-        data = http_get_json(
-            "https://api.bilibili.com/x/v2/reply/reply",
-            params={"type": 1, "oid": aid, "root": rpid, "ps": 20, "pn": 1},
-            cookies=cookies,
-            headers={"Referer": "https://www.bilibili.com/"},
-        )
-        if not isinstance(data, dict) or data.get("code") != 0:
-            return []
-        replies = (data.get("data") or {}).get("replies") or []
+        """Fetch level-2 comments for a given root comment.
+
+        ⭐ 2026-10-04：换用 bilibili_comments.fetch_sub_comments —— 二级评论的
+        /x/v2/reply/reply 实测没被砍（新接口那边也没有 wbi/main 变体，404），
+        这里要的只是同一套 cookie 净化 + 统一的失败处理。
+        """
+        from bilibili_comments import fetch_sub_comments
         out: list[CommentNode] = []
-        for r in replies:
-            node = self._parse_comment(r, level=1, max_depth=max_depth, with_sub_comments=with_sub_comments)
+        for r in fetch_sub_comments(aid, rpid, cookies=self.cookie_header()):
+            node = self._parse_comment(r, level=1, max_depth=max_depth,
+                                       with_sub_comments=False)
             if node:
                 out.append(node)
         return out
@@ -390,6 +363,17 @@ class BilibiliAdapter(PlatformAdapter):
 
     @staticmethod
     def _extract_aid(source: str) -> int | None:
+        # ⭐ 2026-10-04：走 bilibili_comments.resolve_aid（带 WBI 签名的 view 接口，
+        #   失败再退裸参数）。原来这里依赖同目录的 bilibili_helper.bv_to_av（纯本地算法），
+        #   而 collector 那边用的是 view 接口 —— 同一件事两套真相，BV 号算法一改就飘。
+        try:
+            from bilibili_comments import resolve_aid
+            aid = resolve_aid(source)
+            if aid:
+                return int(aid)
+        except Exception:
+            pass
+        # 兜底：旧的本地算法 + 裸接口，保持升级前行为。
         s = (source or "").strip()
         m = re.match(r"av(\d+)", s, re.IGNORECASE)
         if m:
