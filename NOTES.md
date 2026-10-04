@@ -1672,3 +1672,18 @@ skipped）与 `summaryNote`，卡片按它说话，不再只有一句「未写�
 - `register-tools.js` 仍然把宿主的 `context`（含 callToken）丢掉。现在这条不需要了，
   但以后想让 App 借用会话范围的模型配额时，得把它接出来。
 - 其他平台的 `get_comments` 仍是空实现（xhs 除外）。
+
+### v0.6.68 追加（同日）· 采集回执把三件事说出口
+
+ormatAgentPayload（工具回执）新增三段，都是「以前静默、事后变成悬案」的：
+
+- **正文缺席**：transcriptSource=none 且没有 text.txt → 当场提示这条不会有自动总结、
+  补写也没用、要总结得去掉 noAudio 重跑；transcriptionError 单独一条（音频是否已下载）。
+- **评论**：一级/二级条数 + 全文位置（comments[] 不随回执回传的老约定不变）。
+- **总结状态**：ok（要点/回指 + 一句话截断）/ pending（任务号）/ skipped（原因）/ failed（原因 + 卡片补写入口）。
+
+离线验证四种形态全过（noAudio 无字幕 / 前台完成 / 后台排队 / 转写失败）。
+
+⚠️ 已知问题再现：App reload 之后工具 RPC 断（`RPC peer closed; cannot call callback.tools.execute`），
+disable→enable 也救不回来，HTTP 路由不受影响 —— 与 NOTES 之前记录的一致，需重启会话才恢复。
+今天第二次撞上，比上次记录的多知道一点：等 20s、重试、禁用再启用都无效，不是时序问题。
