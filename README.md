@@ -174,8 +174,15 @@ bilibili_video_intake({ source: "BV...", background: true })
 ## 自检
 
 ```sh
-node tests/verify-app.mjs       # mock ctx 装载 + 真起 python 的诊断（当前 15/15）
-node tests/probe-runtime.mjs    # 单独探测 runtime 解析与采集器（分步计时）
+node tests/verify-app.mjs          # mock ctx 装载 + 真起 python 的诊断（当前 15/15）
+node tests/probe-runtime.mjs       # 单独探测 runtime 解析与采集器（分步计时）
+node tests/test-receipt.mjs        # 采集回执的离线断言（纯函数，不依赖 App 装载）
+python tests/test_bilibili_comments.py   # 评论取数的离线回归（10 项）
 ```
+
+后两条是 2026-10-04 那两个「失败得和成功一样安静」的 bug 留下的：
+一条钉死「任何请求都不许再命中已废弃的 `/x/v2/reply`」，另一条钉死回执里
+「正文缺席必须出声、评论必须报数、总结四种状态各有说法」。两者都不碰宿主、不联网，
+所以 App 重载把工具 RPC 弄断之后（见纪律库 BUG-084）仍然跑得动。
 
 <!-- HanaAgent contributor commit -->
