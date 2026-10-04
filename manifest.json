@@ -226,7 +226,7 @@
         "description": "采集 B站/小红书/微博等平台内容，带总结落盘为记录；含搜索、健康诊断、状态诊断。卡片通过 scoped UI 路径自带凭证鉴权。",
         "route": "/intake.html",
         "face": {
-          "image": "face.png"
+          "image": "face-v25.png"
         },
         "cardForm": "flush",
         "titlebar": "solid"
