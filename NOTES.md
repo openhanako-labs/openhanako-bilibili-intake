@@ -1707,3 +1707,25 @@ v25 去掉连线；方块一角真正插进管口、被管体遮住 —— "正�
 - 同日另两枚方向（漏斗 / 收进卡槽）留在 `scripts/icons/build_intake_v25.py`，未入包。
 - 没动：`ui/cover-band.jpg`（1200×170，卡片页顶部暗色横幅带）—— 那是卡片自己的暗色 UI 底纹，
   换暖纸底会跟界面打架；`ui/face.png` 无人引用。
+
+### v0.6.68 追加（同日）· 卡片封面接错槽位：face.image 是 **ui 相对路径**
+
+现场：图标和封面都换成 v25 了，卡片上还是 09-26 那张插画（抱平板的女生）。
+
+根因：`contributes.cards[].face.image` 相对**静态根 `ui/`** 解析，不是包根。
+manifest 里写的是裸文件名 `face.png` → 落到 `ui/face.png`（那张 256×256 插画），
+而当天换的是包根目录的 `face.png` —— 两码事。
+
+证据（不必猜）：`hanako-audio-player` 的 `face.image = "face-portrait.png"`，
+而该文件**只存在于 `ui/` 下** —— 解析根因此确定。宿主文档给的示例同样是
+`"image": "assets/workspace-cover.webp"` 对应 `ui/assets/…`。
+
+改法（照另外四个 App 的既有惯例）：
+- `ui/face-v25.png`（1080×1440，v25 竖版封面）+ manifest 指向它；
+- `ui/face.png` 同步覆盖，包根 `face.png` 保留；
+- **带版本号的文件名是躲图片缓存用的**：mail 用 `face-v4.png`、gallery 用
+  `panel-cover-v3.png`，都是这个道理。裸名换了文件，宿主可能还端旧的缩略图。
+- 插画没丢：`git show HEAD~1:ui/face.png` 可恢复（149448B，md5 6c5789a963）。
+
+顺手核了另外四个 App：它们的 `face.image` 指向的文件都在 `ui/` 下且是新的（audio 10-01 /
+mail 10-02 / gallery 10-02 / 夜航船 10-02）—— 只有 intake 当时落下，包根换了、ui 没换。
