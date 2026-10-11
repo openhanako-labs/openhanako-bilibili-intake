@@ -1727,5 +1727,32 @@ manifest 里写的是裸文件名 `face.png` → 落到 `ui/face.png`（那张 2
   `panel-cover-v3.png`，都是这个道理。裸名换了文件，宿主可能还端旧的缩略图。
 - 插画没丢：`git show HEAD~1:ui/face.png` 可恢复（149448B，md5 6c5789a963）。
 
+### v0.6.69 · 整卡白屏：幽灵元素顶层赋值 + 外链脚本缓存
+
+现场：打开卡片纯空白（无加载中/无空态/无报错），手动点刷新才出数据；DevTools 抓到
+`Uncaught TypeError: Cannot set properties of null (setting 'onclick') @ intake-script.js:1242`。
+
+根因（两层叠加）：
+- 登录条某次改版从 HTML 删除，但脚本顶层 `$("#btn-logout").onclick = …` 留了下来——
+  顶层一炸，`refreshAll()` 永不执行，白屏且无任何占位；
+- 外链脚本（`<script src>`）+ 常驻 iframe：App reload 只换后端代码，旧前端一直活着，
+  白屏现场每次原样重演。
+
+改法（三层，都可复用）：
+- **全景排雷**：扫描器对照 HTML 找出全部幽灵 id（21 个），19 处顶层赋值 + 1 处
+  addEventListener + refreshAll 判空全部加守卫；
+- **null 版冒烟**（tests/test_ui_smoke.mjs）：stub 的 querySelector 故意返 null，
+  任何元素缺失下顶层必须能活着跑完 —— 结构性回归门；
+- **缓存失效**：script src 带 `?v=` 参数 + banner 构建标记（b1116x），
+  新代码是否加载肉眼可验。
+
+同日其他坑（同根性的记一笔）：
+- **遥测上报 403**：卡片 iframe 里所有 `/routes/` 请求都要带 `X-Hana-App-Surface-Session`
+  头（从 location.pathname 解析），裸 fetch 一律被宿主拦 —— 遥测也不能例外；
+- **cookies-logout 不传 --cookies-dir**：Python 把删除打错位置，登出永远删不掉
+  真登录态 —— `--list-logins` 传了、`--logout` 漏了，同文件同参数要成对检查；
+- **PowerShell 正则批量替换的插值坑**：MatchEvaluator 里 `"#$id"` 会把字面量写进文件，
+  一次坏 19 处 —— 这类文本变换一律用 Node 回调，不用 PS 插值。
+
 顺手核了另外四个 App：它们的 `face.image` 指向的文件都在 `ui/` 下且是新的（audio 10-01 /
 mail 10-02 / gallery 10-02 / 夜航船 10-02）—— 只有 intake 当时落下，包根换了、ui 没换。
