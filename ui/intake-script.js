@@ -1,5 +1,9 @@
 // intake-script.js — 卡片前端
 //
+// ⭐ 2026-10-11：前端错误遥测 —— 卡片 iframe 的 console 外面看不到，白屏排查曾只能靠猜。
+//   window.onerror / unhandledrejection 把错误 POST 到 /intake/ui-error 落盘，
+//   实现在下方（需要先拿到 SS 才能过鉴权，403 教训）。
+//
 // v3（app v0.6.16）：
 //   1. 鉴权修复 —— 以前是裸 fetch，全部 403（宿主在框架层拦，不是 Hono 路由问题）。
 //      现在从自己的 scoped UI 路径里取 surface session token，放到
@@ -20,6 +24,30 @@ const ROUTE_BASE = "/api/apps/" + AID + "/routes";
 const SS = (() => {
   const m = /^\/api\/apps\/[^/]+\/ui\/_surface\/([^/]+)\//.exec(location.pathname);
   return m ? m[1] : null;
+})();
+
+// ⭐ 2026-10-11：前端错误遥测（实现在此——必须在 SS 就绪之后，否则上报 403 全部丢失）
+(() => {
+  const seen = new Set();
+  const report = (type, message, stack) => {
+    try {
+      const fp = type + "|" + String(message).slice(0, 120);
+      if (seen.has(fp)) return;
+      seen.add(fp);
+      if (seen.size > 40) seen.clear();
+      const h = { "Content-Type": "application/json" };
+      if (SS) h["X-Hana-App-Surface-Session"] = SS;
+      fetch("/api/apps/bilibili-intake-v2/routes/intake/ui-error", {
+        method: "POST", headers: h,
+        body: JSON.stringify({ type, message: String(message || ""), stack: String(stack || ""), url: String(location.href || "") }),
+      }).catch(() => {});
+    } catch { /* 遥测永不干扰主流程 */ }
+  };
+  window.addEventListener("error", (e) => report("error", e?.message, e?.error?.stack || ""));
+  window.addEventListener("unhandledrejection", (e) => report("unhandledrejection", e?.reason?.message || e?.reason, e?.reason?.stack || ""));
+  window.__intakeReport = report;   // 供脚本其他位置打点
+  // 启动标记：脚本一执行就报（确认「脚本到底跑没跑」）
+  report("boot", "intake-script 顶层开始执行");
 })();
 
 function req(method, p, body) {
@@ -69,6 +97,8 @@ const API = {
   // ⭐ 把所有平台的登录态都收成"粘贴 cookie"这一种形态（扫码在沙箱里不可能通）。
   importCookies: (platform, text) => req("POST", "/intake/login/import-cookies", { platform, text }),
   logout: (platform) => req("POST", "/intake/cookies-logout", { platform }),
+  // 导出某平台整份登录态 bundle（备份/迁机用；恢复 = 粘回 importCookies）
+  exportCookies: (platform) => req("GET", "/intake/cookies-export?platform=" + encodeURIComponent(platform)),
   // /intake/history（后端 L206）与 /intake/logs（L372）都存在，当前 UI 未用。
   //   保留定义，做「历史 / 日志」tab 时直接用，不用回来加。
   history: () => req("GET", "/intake/history"),
@@ -130,6 +160,10 @@ let recRev = "";
 // ⭐ 展开状态跨轮询保留。旧写法每次轮询重建 innerHTML，
 //   `clamped` + `data-open="0"` 会把已展开的总结收回去——用户展开一次、15 秒后被收。
 const openSums = new Set();
+// ⭐ 2026-10-11：结构化要点展开态（与 openSums 解耦：短摘要也能看要点）
+const openPts = new Set();
+// 要点内容缓存（按产物目录），15s 轮询重建列表时不重复拉
+const _pointsCache = new Map();
 // ⭐ 2026-09-22：回填只试一次（记录为空时）。
 let backfillTried = false;
 
@@ -208,12 +242,28 @@ $$(".platform-select button").forEach(b => {
 // ── 记录 ──
 async function renderRecords(force = false) {
   const wrap = $("#records-list");
-  if (!wrap) return;
+  if (!wrap) {
+    // ⭐ 静默 return 会变成纯空白且无任何线索 —— 打点
+    window.__intakeReport?.("render-skip", "renderRecords: #records-list 不存在，静默返回");
+    return;
+  }
   if (!wrap.dataset.loaded) {
     wrap.innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>加载中…</div></div>';
   }
   // ⭐ force（手动点刷新）时不带 rev，强制后端读完再回列表。
-  let r = await API.records(force ? "" : recRev);
+  // ⭐ 2026-10-11：这里以前没有 try-catch —— 首屏那次 fetch 若赶上 App 路由未就绪
+  //   （宿主启动时序），Promise 直接炸掉：DOM 永远停在「加载中…」，且轮询在卡片
+  //   不可见时全跳过，没有任何自愈机会 → 用户看到的就是「第一次进来什么都没有，
+  //   得手动刷新」。现在失败显示原因并标记未就绪，切回卡片时由 visibilitychange 重试。
+  let r;
+  try {
+    r = await API.records(force ? "" : recRev);
+  } catch (e) {
+    wrap.dataset.loaded = "";
+    wrap.innerHTML = '<div class="empty"><div class="e-icon">!</div><div>读取记录失败：' + esc(e?.message || String(e))
+      + '</div><div class="e-sub">切走再切回卡片会自动重试；或点刷新</div></div>';
+    return;
+  }
   // ⭐ 2026-09-22：0.6.26 及以前只有卡片侧采集会写 records.json，模型工具侧一个字不写，
   //   于是会出现「历史里有、记录是 0」。这里自愈一次：发现记录为空就从 captures 回填。
   //   每次打开卡片最多试一次（backfillTried），不会反复扫目录。
@@ -252,6 +302,7 @@ async function renderRecords(force = false) {
     wrap.innerHTML = '<div class="empty"><div class="e-icon">!</div><div>读取记录失败：' + esc(r.error) + "</div></div>";
     return;
   }
+  window.__intakeReport?.("records-loaded", "拿到列表 total=" + (r.total || 0) + " items=" + (r.items || []).length);
   const items = r.items || [];
   lastItems = items;
   // 匹配范围用整条记录的 JSON 串 —— 标题 / 平台 / 链接 / 总结正文一网打尽，
@@ -329,15 +380,27 @@ async function renderRecords(force = false) {
         ${statusChip}
         ${rec.transcriptChars ? '<span title="采集到的正文字符数">' + rec.transcriptChars + " 字</span>" : ""}
         ${rec.commentCount ? '<span title="采到的评论数（一级评论条数）">评论 ' + esc(rec.commentCount) + "</span>" : ""}
-        ${rec.summaryPoints ? '<span class="tag" title="结构化摘要：要点数与回指校验结果（回指不到 = 可能编的）">要点 ' + rec.summaryPoints + (rec.summaryUngrounded ? " · 未回指 " + rec.summaryUngrounded : " · 已全部回指") + "</span>" : ""}
+        ${rec.summaryPoints ? '<button class="tag rec-pt-toggle" data-id="' + esc(rec.id) + '" title="展开/收起结构化要点（来自 summary.json，含回指校验）">要点 ' + rec.summaryPoints + (rec.summaryUngrounded ? " · 未回指 " + rec.summaryUngrounded : " · 已全部回指") + (openPts.has(rec.id) ? " ▴" : " ▾") + "</button>" : ""}
         <span class="rec-when" title="最近更新">${fmtAgo(rec.updatedAt || rec.createdAt)}</span>
       </div>
       ${summary}
+      ${openPts.has(rec.id) && rec.artifactDir ? '<div class="rec-points" data-dir="' + esc(rec.artifactDir) + '"><span class="pt-empty">要点加载中…</span></div>' : ""}
       ${tags ? '<div class="rec-tags">' + tags + "</div>" : ""}
       ${rec.source ? '<div class="rec-src">' + esc(rec.source) + "</div>" : ""}
       ${rec.artifactDir ? '<div class="rec-src" title="采集产物目录：正文 text.txt、原始字幕、报告、帧图都在这里；不采集就不会删">产物：' + esc(rec.artifactDir) + "</div>" : ""}
     </div>`;
   }).join("");
+
+  // ⭐ 2026-10-11：结构化要点展开。数据源是 artifact API 已带回的 summary
+  //   （brief + points[{text, at, grounded}]），不用新开路由；缓存按产物目录，
+  //   轮询重建列表后缓存命中不重复请求。
+  $(".rec-pt-toggle", wrap) && $$(".rec-pt-toggle", wrap).forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.id;
+    if (openPts.has(id)) openPts.delete(id); else openPts.add(id);
+    renderRecords();
+  });
+  fillPoints(wrap);
 
   // ⭐ W3：删除前先确认。文案里说清“会删什么”与“哪些会留档”，
   //   不靠一个孤零零的 ✕ 让用户猜它删到哪一层。
@@ -417,15 +480,15 @@ async function doCapture() {
   }
   const btn = $("#btn-capture");
   btn.disabled = true; btn.textContent = "采集中…";
-  $("#capture-status").textContent = "正在采集 " + platName(currentPlatform) + "…";
-  $("#capture-status").className = "status";
+  const _b_capture_status = "#capture-status"; if (_b_capture_status) _b_capture_status.textContent = "正在采集 " + platName(currentPlatform) + "…";
+  const _b_capture_status_1 = "#capture-status"; if (_b_capture_status_1) _b_capture_status_1.className = "status";
   try {
     const r = await API.fetch({ source: src, platform: currentPlatform, saveRecord: true });
     // ⭐ 形状判定，不靠 r.ok：后端 collector 直返的 JSON 里没有 ok 字段
     // （search/health/cookies 都没有），靠 r.ok 会把成功当失败。
     if (!r.title && !Array.isArray(r.results)) {
       flash("#capture-status", "采集失败：" + (r.error || "响应缺少 title"), true);
-      $("#tc-capture").innerHTML = '<div class="empty"><div class="e-icon">!</div><div>' + esc(r.error || "响应缺少 title") + "</div></div>";
+      const _b_tc_capture = "#tc-capture"; if (_b_tc_capture) _b_tc_capture.innerHTML = '<div class="empty"><div class="e-icon">!</div><div>' + esc(r.error || "响应缺少 title") + "</div></div>";
       return;
     }
     renderCapture(r);
@@ -503,11 +566,11 @@ async function doSearch() {
   // ⭐ 切标签后立刻给加载态。否则用户看到「搜索结果会显示在这里」
   //   以为搜索没开始或失败了——请求其实正在跑，只有顶部状态条在动。
   //   和 renderRecords 首次加载显示「加载中…」的处理一致。
-  $("#tc-search").innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>搜索中…</div><div class="e-sub">在 ' + esc(platName(currentPlatform)) + ' 搜索「' + esc(kw) + '」</div></div>';
+  const _b_tc_search = "#tc-search"; if (_b_tc_search) _b_tc_search.innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>搜索中…</div><div class="e-sub">在 ' + esc(platName(currentPlatform)) + ' 搜索「' + esc(kw) + '」</div></div>';
   const btn = $("#btn-search");
   btn.disabled = true; btn.textContent = "搜索中…";
-  $("#search-status").textContent = "正在搜索 " + platName(currentPlatform) + "…";
-  $("#search-status").className = "status";
+  const _b_search_status = "#search-status"; if (_b_search_status) _b_search_status.textContent = "正在搜索 " + platName(currentPlatform) + "…";
+  const _b_search_status_1 = "#search-status"; if (_b_search_status_1) _b_search_status_1.className = "status";
   try {
     const r = await API.search(kw, 0, 20, currentPlatform);
     const el = $("#tc-search");
@@ -560,15 +623,30 @@ async function renderStatus() {
     ? ' <span class="st-cached">缓存 ' + fmtAgo(new Date(o._cachedAt).toISOString()) + "</span>"
     : "";
 
-  // 运行时
+  // 运行时 —— venv 路径/来源来自 health.env（JS 侧的运行时决策，Python 报不了）
   const rt = h.runtime || {};
+  const env = h.env || {};
+  const venvSrc = env.reusedLegacyRuntime
+    ? "复用 v1 环境"
+    : (env.runtimeSource === "config" ? "显式配置" : (env.runtimeSource ? "自有" : ""));
   const rtRows = [
-    ["Python", rt.python || "—"],
+    ["Python", (rt.python || "—") + (env.mode ? " · " + env.mode : "")],
     ["平台", rt.platform || "—"],
     ["CUDA", rt.cuda_available ? String(rt.cuda) : "CPU"],
-    ["Whisper", rt.whisper || "—"],
-    ["Scrapling", rt.scrapling || "—"],
   ];
+
+  // 依赖清单（health.deps）—— doc-intake 式的"X/Y 已装"逐项表；note 放悬浮提示
+  const deps = h.deps || [];
+  const depRow = (d) => '<div class="st-line"' + (d.note ? ' title="' + esc(d.note) + '"' : "")
+    + '><span class="st-k">' + esc(d.name) + '</span><span class="st-v">'
+    + (d.installed
+      ? '<span class="pv ok">✓ ' + esc(d.version || "已装") + "</span>"
+      : '<span class="pv idle">' + (d.required ? "缺失" : "未装") + "</span>")
+    + "</span></div>";
+  const depsOk = deps.filter((d) => d.installed).length;
+  const depsHtml = deps.length
+    ? '<div class="st-sub">依赖 ' + depsOk + "/" + deps.length + "</div>" + deps.map(depRow).join("")
+    : "";
 
   // 各平台连通性
   const plats = h.platforms || {};
@@ -582,40 +660,70 @@ async function renderStatus() {
     return '<div class="st-line"><span class="st-k">' + esc(PLAT[k] || k) + '</span><span class="st-v">' + pv + "</span></div>";
   }).join("");
 
-  // cookies
-  let ckHtml = '<div class="st-sub">B 站 cookies 文件</div>';
+  // cookies —— 登录态目录 + 各平台明细（用户名/时间/条数）+ 备份入口
+  // cookiesFile（Netscape txt）是 yt-dlp 直连用的另一套，与 JSON 登录态互相独立
   const cf = (st.settings || {}).cookiesFile || "";
-  ckHtml += cf
-    ? '<div class="st-line"><span class="st-k">路径</span><span class="st-v">' + esc(cf) + "</span></div>"
-    : '<div class="st-line"><span class="st-k">路径</span><span class="st-v warn">未设置</span></div>';
+  const logins = ck.logins || [];
+  const loginRow = (x) => {
+    const plat = esc(x.platform || "?");
+    const meta = [x.user && x.user.name, x.captured_at].filter(Boolean).map(esc).join(" · ");
+    return '<div class="st-line"><span class="st-k">' + (PLAT[x.platform] || plat) + "</span>"
+      + '<span class="st-v">'
+      + (x.logged_in
+        ? '<span class="pv ok">✓ ' + (x.cookies_count || 0) + " 条</span>"
+        : '<span class="pv idle">未登录</span>')
+      + (meta ? ' <span class="st-cached">' + meta + "</span>" : "")
+      + (x.logged_in
+        ? ' <button class="ck-export st-export" data-p="' + plat + '" type="button">复制备份</button>'
+        : "")
+      + "</span></div>";
+  };
+  const ckHtml = ""
+    + '<div class="st-line"><span class="st-k">登录态目录</span><span class="st-v">' + esc(ck.cookies_dir || "") + "</span></div>"
+    + (logins.length
+      ? logins.map(loginRow).join("")
+      : '<div class="st-line"><span class="st-k">登录态</span><span class="st-v warn">还没有任何平台，去采集页粘贴</span></div>')
+    + '<div class="st-line"><span class="st-k">yt-dlp cookies 文件</span><span class="st-v">'
+    + (cf ? esc(cf) : '<span class="st-cached">未设置（用上方登录态时不需要）</span>') + "</span></div>";
 
-  // 关键设置
+  // 关键设置 —— 直接可改：下拉/开关 + 一键保存，不用去设置页挖。
+  // 低频参数（ffmpeg、帧分析、线程数等）不在这堆，settings.json 手调。
   const s = st.settings || {};
-  const setRows = [
-    ["Whisper 模型", s.whisperModel || "—"],
-    ["转写设备", s.whisperDevice || "—"],
-    ["字幕优先语言", s.preferredSubtitleLanguages || "—"],
-    ["音频格式", s.audioFormat || "—"],
-    ["启用平台", s.enabledPlatforms || "—"],
-    ["运行模式", s.runtimeMode || "—"],
-    ["最大正文", s.maxReturnedTranscriptChars ? s.maxReturnedTranscriptChars + " 字符" : "—"],
-    ["视觉分析", s.visionEnabled ? "已启用（宿主视觉通道）" : "未启用"],
-  ];
+  const selCtl = (id, label, opts, cur) => '<div class="st-line"><span class="st-k">' + esc(label)
+    + '</span><span class="st-v"><select id="' + id + '" class="st-ctl" style="max-width:150px">'
+    + opts.map((o) => '<option value="' + esc(o) + '"' + (String(cur) === o ? " selected" : "") + ">" + esc(o) + "</option>").join("")
+    + '</select></span></div>';
+  const chkCtl = (id, label, on) => '<div class="st-line"><span class="st-k">' + esc(label)
+    + '</span><span class="st-v"><input type="checkbox" id="' + id + '" class="st-ctl"' + (on ? " checked" : "") + '></span></div>';
+  const txtCtl = (id, label, val, ph) => '<div class="st-line"><span class="st-k">' + esc(label)
+    + '</span><span class="st-v"><input type="text" id="' + id + '" class="st-ctl" value="' + esc(val || "")
+    + '" placeholder="' + esc(ph || "") + '" style="max-width:230px"></span></div>';
+  const setHtml = ""
+    + selCtl("set-runtime", "运行模式", ["auto", "native", "wsl"], s.runtimeMode || "auto")
+    + selCtl("set-model", "Whisper 模型", ["tiny", "base", "small", "medium", "large"], s.whisperModel || "base")
+    + selCtl("set-device", "转写设备", ["auto", "cuda", "cpu"], s.whisperDevice || "auto")
+    + txtCtl("set-langs", "优先字幕语言", s.preferredSubtitleLanguages || "", "zh-Hans,zh,en,ja")
+    + txtCtl("set-plats", "启用平台", s.enabledPlatforms || "", "bilibili,xhs,weibo,zhihu,tieba")
+    + chkCtl("set-vision", "视觉帧分析", !!s.visionEnabled)
+    + chkCtl("set-sumauto", "自动写总结", s.summaryAuto !== false)
+    + '<div class="st-line"><span class="st-k">操作</span><span class="st-v">'
+    + '<button id="set-save" type="button" class="st-save">保存设置</button> <span id="set-out" class="st-cached"></span></span></div>';
 
   el.innerHTML = `
     <div class="st-block">
       <div class="st-head">运行时${cachedTag(h)}${h.runtime ? "" : '<span class="dot err">异常</span>'}</div>
       ${rtRows.map(([k, v]) => '<div class="st-line"><span class="st-k">' + esc(k) + '</span><span class="st-v">' + esc(v) + "</span></div>").join("")}
+      ${env.venvDir ? '<div class="st-line"><span class="st-k">venv</span><span class="st-v">' + esc(env.venvDir) + (venvSrc ? ' <span class="st-cached">' + esc(venvSrc) + "</span>" : "") + "</span></div>" : ""}
+      ${depsHtml}
       ${platRows ? '<div class="st-sub" style="margin-top:10px">各平台</div>' + platRows : ""}
     </div>
     <div class="st-block">
       <div class="st-head">Cookies${cachedTag(ck)}</div>
       ${ckHtml}
-      <div class="st-line"><span class="st-k">登录集合</span><span class="st-v">${(ck.logins || []).length} 项</span></div>
     </div>
     <div class="st-block">
       <div class="st-head">设置</div>
-      ${setRows.map(([k, v]) => '<div class="st-line"><span class="st-k">' + esc(k) + '</span><span class="st-v">' + esc(v) + "</span></div>").join("")}
+      ${setHtml}
     </div>
     <div class="st-block" id="llm-block"><div class="st-head">知识地图模型</div><div class="empty"><div>加载中…</div></div></div>
     <div class="st-block">
@@ -624,8 +732,98 @@ async function renderStatus() {
       <div class="st-line"><span class="st-k">路由</span><span class="st-v">${ROUTE_BASE}</span></div>
     </div>`;
 
+  // 设置块：一键保存（spread 保留 settings.json 里的高级项，POST 是整体替换）
+  const saveBtn = $("#set-save");
+  if (saveBtn) saveBtn.onclick = async () => {
+    const out = $("#set-out");
+    const val = (id) => (($(id) || {}).value || "").trim();
+    const next = {
+      ...(st.settings || {}),
+      runtimeMode: val("set-runtime") || "auto",
+      whisperModel: val("set-model") || "base",
+      whisperDevice: val("set-device") || "auto",
+      preferredSubtitleLanguages: val("set-langs"),
+      enabledPlatforms: val("set-plats"),
+      visionEnabled: !!($("#set-vision") || {}).checked,
+      summaryAuto: !!($("#set-sumauto") || {}).checked,
+    };
+    saveBtn.disabled = true;
+    if (out) out.textContent = "保存中…";
+    try {
+      await API.settings.set(next);
+      if (out) out.textContent = "已保存，立即生效";
+    } catch (e) {
+      if (out) out.textContent = "失败：" + (e?.message || e);
+    }
+    saveBtn.disabled = false;
+  };
+
+  // 备份按钮：导出整份 bundle JSON 到剪贴板；剪贴板不可用时退到手选复制
+  el.querySelectorAll(".ck-export").forEach((btn) => {
+    btn.onclick = async () => {
+      const plat = btn.dataset.p || "";
+      btn.disabled = true;
+      const done = (txt) => { btn.textContent = txt; setTimeout(() => { btn.disabled = false; btn.textContent = "复制备份"; }, 2500); };
+      try {
+        const r = await API.exportCookies(plat);
+        if (!r || !r.ok) { done("失败"); return; }
+        try {
+          await navigator.clipboard.writeText(r.text || "");
+          done("已复制");
+        } catch {
+          // 剪贴板权限拿不到（iframe 沙箱）：退到临时文本域手动 Ctrl+A/C
+          const ta = document.createElement("textarea");
+          ta.value = r.text || "";
+          ta.style.cssText = "width:100%;height:120px;margin-top:6px;font-family:var(--font-mono);font-size:11px";
+          ta.onclick = () => ta.select();
+          btn.parentElement.appendChild(ta);
+          ta.select();
+          done("请全选复制");
+        }
+      } catch { done("失败"); }
+    };
+  });
+
   // ⭐ 知识地图模型选择器（单独异步加载，不堵住状态区）
   loadLlmBlock(s);
+}
+
+/**
+ * 结构化要点填充：展开的记录按产物目录拉 artifact API（summary 字段已带回），
+ * 渲染一句话 + 分条要点（带时间戳/小节锚点；回指未过的标红）。
+ * 缓存按产物目录：15s 轮询重建列表后缓存命中，不重复请求。
+ */
+function paintPoints(box, s) {
+  if (!s || !Array.isArray(s.points) || !s.points.length) {
+    box.innerHTML = '<span class="pt-empty">这条还没有结构化要点（旧记录或总结未含要点）</span>';
+    return;
+  }
+  const brief = s.brief ? '<div class="pt-brief">' + esc(s.brief) + "</div>" : "";
+  const items = s.points.map((p) => {
+    // 回指状态两种写法都收：validatePoints 的 grounded / 落盘 summary.json 的 verified
+    const bad = p.grounded === false || p.verified === false;
+    const at = p.at ? '<span class="pt-at' + (bad ? " bad" : "") + '" title="' + (bad ? "回指校验未通过：正文里找不到这个出处，可能是编的" : "出处锚点") + '">' + esc(p.at) + "</span>" : "";
+    return "<li" + (bad ? ' class="bad" title="回指校验未通过：可能是编的"' : "") + ">" + esc(p.text) + at + "</li>";
+  }).join("");
+  box.innerHTML = brief + '<ol class="pt-list">' + items + "</ol>";
+}
+
+async function fillPoints(wrap) {
+  const boxes = $$(".rec-points", wrap);
+  if (!boxes.length) return;
+  for (const box of boxes) {
+    const dir = box.dataset.dir || "";
+    if (!dir) continue;
+    if (_pointsCache.has(dir)) { paintPoints(box, _pointsCache.get(dir)); continue; }
+    try {
+      const r = await API.artifact(dir);
+      const s = (r && r.summary) || null;
+      _pointsCache.set(dir, s);
+      if (box.isConnected) paintPoints(box, s);
+    } catch {
+      if (box.isConnected) box.innerHTML = '<span class="pt-empty">要点读取失败</span>';
+    }
+  }
 }
 
 /**
@@ -656,8 +854,8 @@ async function loadLlmBlock(currentSettings) {
   el.innerHTML = '<div class="st-head">知识地图模型<span class="st-cached">复用宿主，key 不下发</span></div>'
     + '<div class="st-line"><span class="st-k">可选项</span><span class="st-v">' + providers.length + ' 个供应商 / ' + options.length + ' 个模型</span></div>'
     + (data?.fallback ? '<div class="st-sub">宿主模型列表读不到，以下来自 provider-catalog.json 兜底（可能含非聊天模型）</div>' : '')
-    + '<div class="st-line"><span class="st-k">选用</span><span class="st-v"><select id="llm-pick" style="max-width:260px">' + optHtml + '</select></span></div>'
-    + '<div class="st-line"><span class="st-k">操作</span><span class="st-v"><button id="llm-save" type="button">保存</button> <button id="llm-test" type="button">测试连通</button> <span id="llm-out"></span></span></div>';
+    + '<div class="st-line"><span class="st-k">选用</span><span class="st-v"><select id="llm-pick" class="st-ctl" style="max-width:260px">' + optHtml + '</select></span></div>'
+    + '<div class="st-line"><span class="st-k">操作</span><span class="st-v"><button id="llm-save" type="button" class="st-save">保存</button> <button id="llm-test" type="button" class="st-save">测试连通</button> <span id="llm-out"></span></span></div>';
 
   const picked = () => {
     const v = ($("#llm-pick") || {}).value || "";
@@ -747,7 +945,8 @@ async function renderLogs() {
 // ── 启动 ──
 async function refreshAll() {
   renderRecords();
-  if ($("#tc-status").classList.contains("on")) renderStatus();
+  const _ts = $("#tc-status");
+  if (_ts && _ts.classList.contains("on")) renderStatus();
 }
 function startPoll() {
   if (pollTimer) clearInterval(pollTimer);
@@ -757,6 +956,21 @@ function startPoll() {
     if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     refreshAll();
   }, 15000);
+  // ⭐ 2026-10-11：切回卡片立即拉一次，不等下一个 15s 轮询——
+  //   这是「第一次进卡片是空的」的主修复：预热阶段失败的加载，打开瞬间重试。
+  document.addEventListener?.("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      // 心跳：进遥测日志，用于还原「卡片打开时脚本是否活着」
+      try {
+        fetch("/api/apps/bilibili-intake-v2/routes/intake/ui-error", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "heartbeat-visible", message: "卡片切回可见，refreshAll 发起" }),
+        }).catch(() => {});
+      } catch { /* 不干扰 */ }
+      refreshAll();
+    }
+  });
 }
 
 setAuthStatus();
@@ -771,14 +985,14 @@ const _bc = $("#btn-capture"); if (_bc) _bc.onclick = doCapture;   // 卡片已�
 const _bs = $("#btn-search"); if (_bs) _bs.onclick = doSearch;      // 卡片已去掉搜索栏
 // ⭐ 2026-09-26：过滤框接线（防抖 250ms，避免每个字都打一次后端）。
 let recFilterTimer = null;
-$("#rec-filter").oninput = (e) => {
+const _rf = $("#rec-filter"); if (_rf) _rf.oninput = (e) => {
   recFilter = (e.target && e.target.value) || "";
   if (recFilterTimer) clearTimeout(recFilterTimer);
   recFilterTimer = setTimeout(() => renderRecords(true), 250);   // 过滤必须重画，别撞 unchanged 早退
 };
 
-$("#btn-refresh").onclick = () => { renderRecords(true); if ($("#tc-status").classList.contains("on")) renderStatus(); };
-$("#btn-new-rec").onclick = async () => {
+const _brf = $("#btn-refresh"); if (_brf) _brf.onclick = () => { renderRecords(true); if ($("#tc-status").classList.contains("on")) renderStatus(); };
+const _b_btn_new_rec = "#btn-new-rec"; if (_b_btn_new_rec) _b_btn_new_rec.onclick = async () => {
   // ⭐ 旧写法 prompt 链只判了第一步：任意后续一步取消（返回 null），
   //   后面的 prompt 仍会连着弹完。而且保存时不带 platform，
   //   记录的平台字段会丢、canonical id 退化，同一个视频又变两条。
@@ -794,14 +1008,14 @@ $("#btn-new-rec").onclick = async () => {
   flash("#rec-status", r.ok ? "已记录" : "记录失败：" + (r.error || ""), !r.ok);
   renderRecords();
 };
-$("#btn-trash").onclick = async () => {
+const _b_btn_trash = "#btn-trash"; if (_b_btn_trash) _b_btn_trash.onclick = async () => {
   const t = await API.trash();
   if (!t.ok) return flash("#rec-status", "读缓冲失败：" + (t.error || ""), true);
   if (!t.count) return flash("#rec-status", "缓冲是空的", false);
   const names = (t.items || []).slice(0, 6).map(i => `${i.day}/${i.slot}`).join("、");
   flash("#rec-status", `缓冲：${t.count} 个槽位的留档（${(t.bytes / 1048576).toFixed(1)} MB）— ${names}${t.count > 6 ? " 等" : ""}`, false);
 };
-$("#btn-trash-empty").onclick = async () => {
+const _b_btn_trash_empty = "#btn-trash-empty"; if (_b_btn_trash_empty) _b_btn_trash_empty.onclick = async () => {
   if (!(await askConfirm("彻底清空删除缓冲？里面的总结留档将不可恢复。"))) return;
   const d = await API.emptyTrash();
   flash("#rec-status", d.ok ? `缓冲已清空（${d.removed} 个槽位）` : "清空失败：" + (d.error || ""), !d.ok);
@@ -825,20 +1039,20 @@ function bulkInvert() {
   updateBulkInfo();
   renderRecords();
 }
-$("#btn-bulk-all").onclick = bulkToggleAll;
-$("#btn-bulk-inv").onclick = bulkInvert;
+const _b_btn_bulk_all = "#btn-bulk-all"; if (_b_btn_bulk_all) _b_btn_bulk_all.onclick = bulkToggleAll;
+const _b_btn_bulk_inv = "#btn-bulk-inv"; if (_b_btn_bulk_inv) _b_btn_bulk_inv.onclick = bulkInvert;
 
-$("#btn-bulk").onclick = () => {
+const _b_btn_bulk = "#btn-bulk"; if (_b_btn_bulk) _b_btn_bulk.onclick = () => {
   bulkMode = !bulkMode;
   if (!bulkMode) pickedIds.clear();
-  $("#btn-bulk").textContent = bulkMode ? "取消选择" : "批量选择";
+  const _b_btn_bulk_1 = "#btn-bulk"; if (_b_btn_bulk_1) _b_btn_bulk_1.textContent = bulkMode ? "取消选择" : "批量选择";
   // 全选/反选只在批量模式下出现（非批量模式下它们是噪音）
   { const x = $("#btn-bulk-all"); if (x) x.hidden = !bulkMode; }
   { const x = $("#btn-bulk-inv"); if (x) x.hidden = !bulkMode; }
   updateBulkInfo();
   renderRecords();
 };
-$("#btn-bulk-del").onclick = async () => {
+const _b_btn_bulk_del = "#btn-bulk-del"; if (_b_btn_bulk_del) _b_btn_bulk_del.onclick = async () => {
   const ids = [...pickedIds];
   if (!ids.length) return flash("#rec-status", "还没选记录", true);
   const sumCount = lastItems.filter(x => ids.includes(x.id) && x.summary).length;
@@ -855,7 +1069,7 @@ $("#btn-bulk-del").onclick = async () => {
 
 // ⭐ 2026-10-04：批量补写总结。历史里 22 条只有 1 条有总结（自动总结从未成功过），
 //   一两条点得完，二十多条不可能。已有总结的跳过，不拿旧摘要去占模型调用。
-$("#btn-bulk-sum").onclick = async () => {
+const _b_btn_bulk_sum = "#btn-bulk-sum"; if (_b_btn_bulk_sum) _b_btn_bulk_sum.onclick = async () => {
   const ids = [...pickedIds];
   if (!ids.length) return flash("#rec-status", "还没选记录", true);
   const targets = lastItems.filter(x => ids.includes(x.id) && !x.summary);
@@ -877,8 +1091,8 @@ $("#btn-bulk-sum").onclick = async () => {
   updateBulkInfo();
   setTimeout(() => renderRecords(true), 1500);
 };
-$("#confirm-yes").onclick = () => closeConfirm(true);
-$("#confirm-no").onclick = () => closeConfirm(false);
+const _b_confirm_yes = "#confirm-yes"; if (_b_confirm_yes) _b_confirm_yes.onclick = () => closeConfirm(true);
+const _b_confirm_no = "#confirm-no"; if (_b_confirm_no) _b_confirm_no.onclick = () => closeConfirm(false);
 
 // ── 画面分析报告：点「报告」→ 弹窗里内嵌整页 ──
 //   报告是自包含的单文件 HTML（样式内联），所以用 srcdoc 而不是 iframe src ——
@@ -917,11 +1131,44 @@ async function __loadReport(shotDir, shownPath) {
     err = (e && e.message) || String(e);
   }
   if (!r || !r.ok) {
-    msg("这条记录还没有可看的报告",
-        "原因：" + esc(err || (r && r.error) || "未知原因")
-        + "<br>报告由画面分析（intake_shots）生成，落在 &lt;采集目录&gt;/shots/report.html。"
-        + "<br>先对它跑一次画面分析，再点这里。");
+    // ⭐ 2026-10-11：读不到画面分析报告时不再空手而归——
+    //   总结（summary.json）和正文（text.txt）就在同一个产物目录里，直接渲染给人看。
+    //   弹窗从“路标”变“内容页”：顶部一条提示，下面是要点与正文摘录。
+    let a = null;
+    try { a = await API.artifact(String(shotDir).replace(/[\\/]+shots$/, "")); } catch { /* 下面的空态兜底 */ }
+    const s = a && a.summary;
+    const parts = [];
+    parts.push('<div style="background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.25);border-radius:8px;padding:8px 12px;margin-bottom:14px;font-size:12px;color:#8a6d3b;line-height:1.7">'
+      + "画面分析还没跑过（跑完这里会显示镜头报告）。以下是这条记录的总结与正文摘录。</div>");
+    if (s && (s.brief || (Array.isArray(s.points) && s.points.length))) {
+      if (s.brief) parts.push('<div style="font-size:14px;font-weight:600;line-height:1.7;margin-bottom:10px">' + esc(s.brief) + "</div>");
+      const pts = (s.points || []).map((p) => {
+        const bad = p.grounded === false || p.verified === false;
+        const atColor = bad ? "color:#b45309" : "color:#9e9b97";
+        return '<li style="margin-bottom:6px;' + (bad ? "color:#b45309;" : "") + '">'
+          + esc(p.text)
+          + (p.at ? ' <span style="font-family:ui-monospace,monospace;font-size:11px;' + atColor + '">' + esc(p.at) + "</span>" : "")
+          + "</li>";
+      }).join("");
+      parts.push('<ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.8">' + pts + "</ol>");
+    } else {
+      parts.push('<div style="color:#6c6965">这条还没有结构化总结。可在记录列表勾选后批量补写，或点「补写总结」。</div>');
+    }
+    const txt = a && a.text && a.text.chars;
+    if (txt) {
+      parts.push('<hr style="border:none;border-top:1px solid #eee6df;margin:14px 0">');
+      parts.push('<div style="font-size:11px;color:#9e9b97;margin-bottom:6px">正文摘录（前 4000 字 / 共 ' + a.text.total + " 字）</div>");
+      parts.push('<div style="font-size:12.5px;line-height:1.9;white-space:pre-wrap;color:#3d3a37">' + esc(txt) + "</div>");
+      if (a.text.nextOffset) parts.push('<div style="color:#9e9b97;font-size:11px;margin-top:8px">正文未完，其余在产物目录 text.txt</div>');
+    }
+    frame.srcdoc = '<!doctype html><meta charset="utf-8"><body style="font:13px/1.8 system-ui,sans-serif;color:#1e1d1c;padding:24px;max-width:720px;margin:0 auto">' + parts.join("") + "</body>";
     return;
+    // —— 以下是原来的纯提示（保留在注释里备查）——
+    // msg("这条记录还没有可看的报告",
+    //     "原因：" + esc(err || (r && r.error) || "未知原因")
+    //     + "<br>报告由画面分析（intake_shots）生成，落在 &lt;采集目录&gt;/shots/report.html。"
+    //     + "<br>先对它跑一次画面分析，再点这里。");
+    // return;
   }
   if (!r.content) {
     msg("报告文件是空的", "文件存在但内容为 0 字节，可能上次生成被中断了。重新跑一次画面分析即可。");
@@ -934,12 +1181,12 @@ async function __loadReport(shotDir, shownPath) {
   const frame = $("#report-frame");
   if (frame) frame.removeAttribute("srcdoc");
 }
-$("#report-close").onclick = closeReport;
-$("#report-modal").onclick = (e) => { if (e.target === $("#report-modal")) closeReport(); };
+const _b_report_close = "#report-close"; if (_b_report_close) _b_report_close.onclick = closeReport;
+const _b_report_modal = "#report-modal"; if (_b_report_modal) _b_report_modal.onclick = (e) => { if (e.target === $("#report-modal")) closeReport(); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeReport(); });
 
 // 事件代理：记录列表会被整体重建（innerHTML），逐个绑定会在下一轮轮询后失效。
-$("#records-list").addEventListener("click", (e) => {
+const _rl = $("#records-list"); if (_rl) _rl.addEventListener("click", (e) => {
   const b = e.target.closest && e.target.closest(".rec-report");
   if (!b) return;
   e.stopPropagation();
@@ -996,7 +1243,7 @@ async function refreshLoginState(force) {
 
 // 轮询登录状态（后端读 state.json）。约 200 秒后放弃 —— 二维码本身也会过期。
 
-$("#btn-logout").onclick = async () => {
+$("#btn-logout") && ($("#btn-logout").onclick = async () => {
   const plat = currentPlatform;
   if (!(await askConfirm("删掉 " + platName(plat) + " 在本地的 cookies？下次采集要重新扫码。"))) return;
   const r = await API.logout(plat);
@@ -1004,7 +1251,7 @@ $("#btn-logout").onclick = async () => {
   else flash("#login-state", "登出失败：" + ((r && r.error) || ""), true);
   cookiesStale();
   await refreshLoginState(true);
-};
+});
 
 // 登录/登出都改了盘上的 cookies，缓存（后端 60s TTL + 我这个 60s）得跟着失效。
 function cookiesStale() {
@@ -1017,8 +1264,14 @@ function cookiesStale() {
 // 为什么把「扫码登录」换成这个：App 跑在宿主的 Windows 沙箱里，启动不了任何浏览器
 //（直指 exe 被拒、channel 靠注册表读不到、自带 chromium 未安装，批准 runtime 权限也一样）。
 // 所以登录态只有一种形态：你把 cookie 粘进来。全程在 App 内、零窗口、所有平台同一套。
-$("#btn-login").textContent = "粘贴 cookie";
-$("#btn-login").onclick = () => showCookieBox(currentPlatform);
+// ⭐ 2026-10-11：登录条已从 HTML 移除（登录态收进粘贴流程），但这里的顶层绑定还在——
+//   无守卫的 $("#btn-login") 赋值在元素缺失时直接 TypeError，脚本当场死在顶层，
+//   refreshAll() 永远不执行 → 整卡白屏（实测抓到的元凶）。统一加守卫。
+const _btnLogin = $("#btn-login");
+if (_btnLogin) {
+  _btnLogin.textContent = "粘贴 cookie";
+  _btnLogin.onclick = () => showCookieBox(currentPlatform);
+}
 
 function cookieBoxNode() {
   let box = document.getElementById("cookie-box");
@@ -1043,9 +1296,10 @@ function showCookieBox(plat) {
 
   const how = document.createElement("div");
   how.style.cssText = "font-size:12px;color:var(--ink-2);line-height:1.6";
-  how.textContent = "把 " + platName(plat) + " 的登录 cookie 粘在下面，两种都行："
+  how.textContent = "把 " + platName(plat) + " 的登录 cookie 粘在下面，三种都行："
     + "① 浏览器 Console 里 document.cookie 的整串；"
-    + "② 用 Cookie-Editor 之类扩展导出成 JSON 数组（这种更全，含 HttpOnly 的条目）。";
+    + "② Cookie-Editor 之类扩展导出的 JSON 数组（这种更全，含 HttpOnly 的条目）；"
+    + "③ 状态页「复制备份」导出的整份 JSON —— 拿它可以直接恢复登录态。";
   box.appendChild(how);
 
   const ta = document.createElement("textarea");
