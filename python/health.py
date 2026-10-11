@@ -88,6 +88,48 @@ def get_routing_status() -> dict[str, Any]:
     return status
 
 
+# 依赖清单（逐项 pip 依赖检测，状态页渲染用）。
+# required=true 的缺了主流程跑不起来；可选的缺了降级/禁用对应功能。
+# name 用 pip 的 distribution 名（importlib.metadata.version 按它查）。
+_DEPS: list[dict[str, Any]] = [
+    {"name": "yt-dlp", "module": "yt_dlp", "required": True, "note": "音频/字幕下载，B 站主链路"},
+    {"name": "httpx", "module": "httpx", "required": True, "note": "B 站 API / 评论抓取"},
+    {"name": "scrapling", "module": "scrapling", "required": False, "note": "元数据首选，失败自动降级 yt-dlp"},
+    {"name": "openai-whisper", "module": "whisper", "required": False, "note": "无字幕视频的本地转写"},
+    {"name": "torch", "module": "torch", "required": False, "note": "Whisper 推理（GPU/CPU）"},
+    {"name": "playwright", "module": "playwright", "required": False, "note": "小红书浏览器采集 / 扫码登录"},
+    {"name": "cryptography", "module": "cryptography", "required": False, "note": "从浏览器解密 cookie（提取导入）"},
+]
+
+
+def _collect_deps() -> list[dict[str, Any]]:
+    """逐项检测依赖：装没装 + 版本号。版本拿不到时用 find_spec 兑底判存在。"""
+    from importlib.metadata import PackageNotFoundError, version
+
+    rows: list[dict[str, Any]] = []
+    for dep in _DEPS:
+        row: dict[str, Any] = {
+            "name": dep["name"],
+            "required": dep["required"],
+            "note": dep["note"],
+            "installed": False,
+            "version": "",
+        }
+        try:
+            row["version"] = version(dep["name"])
+            row["installed"] = True
+        except PackageNotFoundError:
+            # distribution 名对不上（比如源码安装）：退回 import 探测，报"已装但版本未知"
+            try:
+                row["installed"] = importlib.util.find_spec(dep["module"]) is not None
+            except Exception:
+                row["installed"] = False
+        except Exception:
+            row["installed"] = False
+        rows.append(row)
+    return rows
+
+
 def run_health_check() -> dict[str, Any]:
     """执行健康诊断，返回完整诊断报告。"""
     report: dict[str, Any] = {
@@ -123,6 +165,9 @@ def run_health_check() -> dict[str, Any]:
         report["runtime"]["scrapling"] = "installed" if spec else "missing"
     except Exception:
         report["runtime"]["scrapling"] = "unknown"
+
+    # ── Dependency inventory ──
+    report["deps"] = _collect_deps()
 
     # ── Platform connectivity ──
     for platform_id, backends in _BACKENDS.items():

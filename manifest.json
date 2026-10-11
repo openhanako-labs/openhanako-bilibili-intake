@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "bilibili-intake-v2",
   "name": "内容摄取 (Bilibili Intake)",
-  "version": "0.6.68",
+  "version": "0.6.69",
   "description": "多平台内容摄取引擎 —— B站 / 小红书 / 微博 / 知乎 / 贴吧 / 抖音 / 快手，也能读本地文档。正文、字幕、评论统一落盘，在卡片里查看、补写总结。",
   "minAppVersion": "0.942.0",
   "entry": "index.js",
@@ -60,17 +60,19 @@
               "wsl"
             ],
             "title": "Python 运行模式",
-            "description": "auto 在 Windows 上优先 native，失败再回退 WSL"
+            "description": "auto 在 Windows 上优先原生 Python，失败再回退 WSL。一般不用动"
           },
-          "nativePythonCommand": {
-            "type": "string",
-            "default": "python",
-            "title": "原生 Python 命令"
+          "autoBootstrapPython": {
+            "type": "boolean",
+            "default": true,
+            "title": "自动创建 Python 虚拟环境",
+            "description": "首次运行自动建 venv 并安装依赖（含 torch，首次较慢）。关掉后需要自己准备环境"
           },
-          "wslPythonCommand": {
+          "runtimeRoot": {
             "type": "string",
-            "default": "python3",
-            "title": "WSL Python 命令"
+            "default": "",
+            "title": "Python 运行时目录（高级）",
+            "description": "留空 = 自动：优先用自己的，否则复用 v1 已建好的环境。填绝对路径则强制使用该目录。其余低频参数（ffmpeg、帧分析、Whisper 线程数等）直接在 settings.json 里手调"
           },
           "whisperModel": {
             "type": "string",
@@ -82,7 +84,8 @@
               "medium",
               "large"
             ],
-            "title": "Whisper 模型"
+            "title": "Whisper 转写模型",
+            "description": "越大越准也越慢；有官方字幕的视频用不到它"
           },
           "whisperDevice": {
             "type": "string",
@@ -95,126 +98,29 @@
             "title": "转写设备",
             "description": "auto 优先 GPU，不可用再回退 CPU"
           },
-          "whisperCpuThreads": {
-            "type": "number",
-            "default": 0,
-            "title": "Whisper CPU 线程数",
-            "description": "0 = 自动（核数一半，最少 1）；正数 = 指定线程数；-1 = 不限制（吃满所有核，旧行为）。只影响走 CPU 转写的视频"
-          },
-          "whisperLanguage": {
-            "type": "string",
-            "default": "",
-            "title": "Whisper 语言",
-            "description": "留空自动识别"
-          },
           "preferredSubtitleLanguages": {
             "type": "string",
             "default": "zh-Hans,zh-CN,zh,ai-zh,zh-TW,en,ja",
             "title": "优先字幕语言顺序",
             "description": "逗号分隔。有字幕时优先直连官方字幕，不走 Whisper"
           },
-          "audioFormat": {
-            "type": "string",
-            "default": "mp3",
-            "title": "音频导出格式"
-          },
-          "cookiesFile": {
-            "type": "string",
-            "default": "",
-            "title": "cookies 文件路径",
-            "description": "可选，适用于 B站/微博/知乎公开数据"
-          },
-          "cookiesDir": {
-            "type": "string",
-            "default": "",
-            "title": "统一 cookies 存储目录",
-            "description": "设置后所有平台自动从该目录加载对应 cookies"
-          },
-          "xhsCookiesFile": {
-            "type": "string",
-            "default": "",
-            "title": "小红书专用 cookies 文件",
-            "description": "需登录态才能拿到 note 详情"
-          },
           "enabledPlatforms": {
             "type": "string",
             "default": "bilibili,xhs,weibo,zhihu,tieba",
             "title": "启用的平台",
-            "description": "逗号分隔；空 = 仅 B站"
-          },
-          "autoBootstrapPython": {
-            "type": "boolean",
-            "default": true,
-            "title": "自动创建 Python 虚拟环境",
-            "description": "首次运行自动建 venv 并安装依赖（含 torch，首次较慢）"
-          },
-          "runtimeRoot": {
-            "type": "string",
-            "default": "",
-            "title": "Python 运行时目录",
-            "description": "留空 = 自动：优先用本应用自己的，否则复用 v1 插件已建好的环境。填绝对路径则强制使用该目录（会被当作可写、可自动安装依赖）"
-          },
-          "maxReturnedTranscriptChars": {
-            "type": "number",
-            "default": 12000,
-            "title": "回传正文最大字符数"
-          },
-          "ffmpegPath": {
-            "type": "string",
-            "default": "",
-            "title": "ffmpeg 路径",
-            "description": "画面分析用。填 ffmpeg.exe 的绝对路径（例如 W:\\Games\\ffmpeg\\bin\\ffmpeg.exe）；留空则去常见安装位置自己找一遍"
-          },
-          "shotsProfile": {
-            "type": "string",
-            "default": "A",
-            "enum": [
-              "A",
-              "B"
-            ],
-            "title": "帧分析档位",
-            "description": "A = 内容档：语义分段（时间窗 + 场景 + 字幕吸附）+ 每段一张帧，服务总结锚点；B = 镜头语言档：运动量曲线 + 首尾两帧 + 联系表 + 全套质量门（更贵）"
-          },
-          "shotsDownloadVideo": {
-            "type": "boolean",
-            "default": false,
-            "title": "下载原片（帧分析用）",
-            "description": "独立开关，默认关。帧分析需要本地原片；关着时对没有原片的记录会直接拒绝并提示，不会偷偷下载"
-          },
-          "shotsMaxSeconds": {
-            "type": "number",
-            "default": 20,
-            "title": "帧分析分段长度上限（秒）",
-            "description": "档 A 用。段数 ≈ 片长 ÷ 这个值；段数超了下面的上限时会自动把这个窗顶大"
-          },
-          "shotsMaxSegments": {
-            "type": "number",
-            "default": 60,
-            "title": "帧分析段数上限",
-            "description": "档 A 用。段数会超过它时自动把分段长度顶大（上限优先于秒数）。段数 ≈ 一次视觉模型调用，这是成本闸门"
-          },
-          "trashKeepDays": {
-            "type": "number",
-            "default": 30,
-            "title": "删除缓冲保留天数",
-            "description": "启动时按它清一次缓冲（只删不写）。设 0 = 不按时间清"
-          },
-          "trashMaxMB": {
-            "type": "number",
-            "default": 500,
-            "title": "删除缓冲体积上限（MB）",
-            "description": "超了就按最旧的先删。设 0 = 不按体积清。缓冲在 captures/.trash/，卡片「缓冲」tab 可见、可手动清空"
+            "description": "逗号分隔：bilibili,xhs,weibo,zhihu,tieba（douyin/kuaishou 未完整实现）。空 = 仅 B站"
           },
           "visionEnabled": {
             "type": "boolean",
             "default": false,
-            "title": "启用视觉帧分析"
+            "title": "启用视觉帧分析",
+            "description": "对有原片的记录做画面分段分析，走宿主视觉通道，不需要配额外 key"
           },
           "summaryAuto": {
             "type": "boolean",
             "default": true,
-            "title": "采集后自动写总结"
-            ,"description": "走宿主模型通道生成「一句话 + 要点」，要点会做回指校验；不需要你在对话里说一句话。关掉就回到「要手动发起」的老行为"
+            "title": "采集后自动写总结",
+            "description": "走宿主模型通道生成「一句话 + 要点」，要点做回指校验。关掉就回到要手动发起的老行为"
           }
         }
       }

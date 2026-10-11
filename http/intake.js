@@ -105,6 +105,17 @@ export default function (app, ctx) {
         return c.json({ ...healthCache.body, _cached: true, _cachedAt: healthCache.at });
       }
       const body = await runJson(ctx, ["--action", "health"], { label: "health", timeoutMs: 60_000 });
+      // venv 决策（自有 / 复用 v1 / 显式 runtimeRoot）只有 JS 侧知道，Python 报不了。
+      // runtimeFor 带 60s 缓存且 health 本来就要起 Python，这里顺手带上零成本。
+      try {
+        const runtime = await runtimeFor(ctx);
+        body.env = {
+          venvDir: runtime.venvDir || "",
+          mode: runtime.mode || "",
+          runtimeSource: runtime.runtimeSource || "",
+          reusedLegacyRuntime: !!runtime.reusedLegacyRuntime,
+        };
+      } catch { body.env = null; }
       healthCache = { at: now, body };
       return c.json({ ...body, _cached: false });
     } catch (e) { return fail(c, e); }
@@ -331,6 +342,9 @@ export default function (app, ctx) {
     try {
       const body = await c.req.json();
       fs.writeFileSync(path.join(dataDir, "settings.json"), JSON.stringify(body, null, 2), "utf-8");
+      // 改设置立即生效：运行时/健康/cookies 三个缓存全部作废，下一请求重新解析。
+      // 以前只有 60s TTL 兜底，改完 setting 要等一分钟才生效，像「改了没用」。
+      invalidateRuntimeCache();
       return c.json({ ok: true });
     } catch (e) { return fail(c, e); }
   });
@@ -443,8 +457,137 @@ export default function (app, ctx) {
   app.post("/intake/cookies-logout", async (c) => {
     try {
       const body = await c.req.json();
-      await runJson(ctx, ["--logout", body.platform || "xhs"], { label: "cookies-logout", timeoutMs: 30_000 });
+      // ⚠️ 必须传 --cookies-dir：不传时 Python 的 CookieStore 落到源码目录，
+      // 登出删的是错误位置，真登录态永远删不掉（e2e 实测抓到的）。
+      await runJson(ctx, ["--logout", body.platform || "xhs", "--cookies-dir", path.join(dataDir, "cookies")], { label: "cookies-logout", timeoutMs: 30_000 });
+      cookiesCache = null;
       return c.json({ ok: true });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 粘贴导入登录态（2026-10-11 补：UI 一直在调这条，后端一直缺这条）──
+  //
+  // 卡片的「粘贴 cookie」按钮发 POST /intake/login/import-cookies，期望 {ok, count, names}。
+  // 后端从来没实现过这个路由 —— 点保存必 404。
+  //
+  // 设计：JS 直接写 <dataDir>/cookies/<platform>.json，不 spawn Python（快，且和
+  // --list-logins 读的是同一个目录）。文件格式严格对齐 python/cookies_store.py 的
+  // CookieBundle：条目只有七个 snake_case 字段（CookieEntry(**c) 遇未知键会崩）。
+  // 三种输入都收：
+  //   ① document.cookie 的整串（a=1; b=2）
+  //   ② Cookie-Editor 导出的 JSON 数组（能带上 HttpOnly 条目，更完整）
+  //   ③ 「复制备份」导出的整份 bundle JSON —— 恢复走同一个入口，备份闭环
+  const COOKIE_ENTRY_KEYS = ["name", "value", "domain", "path", "expires", "http_only", "secure"];
+
+  const normalizeEntry = (x) => ({
+    name: String(x.name),
+    value: String(x.value),
+    domain: String(x.domain || ""),
+    path: String(x.path || "/"),
+    // Cookie-Editor 用 expirationDate（unix 秒，可能带小数），bundle 内部叫 expires
+    expires: Math.max(0, Math.round(Number(x.expirationDate ?? x.expires ?? 0)) || 0),
+    http_only: !!(x.http_only ?? x.httpOnly),
+    secure: !!x.secure,
+  });
+
+  function parseCookieText(text) {
+    const t = String(text || "").trim();
+    if (!t) return [];
+    if (t.startsWith("[") || t.startsWith("{")) {
+      const obj = JSON.parse(t);
+      const arr = Array.isArray(obj) ? obj : obj.cookies;
+      if (!Array.isArray(arr)) throw new Error("JSON 里没有 cookies 数组");
+      return arr.filter((x) => x && x.name && x.value != null).map(normalizeEntry);
+    }
+    return t
+      .split(";")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((pair) => {
+        const i = pair.indexOf("=");
+        if (i <= 0) return null;
+        return normalizeEntry({ name: pair.slice(0, i).trim(), value: pair.slice(i + 1).trim() });
+      })
+      .filter(Boolean);
+  }
+
+  function localStamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+      + "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  app.post("/intake/login/import-cookies", async (c) => {
+    try {
+      const body = await c.req.json();
+      const platform = String(body.platform || "").trim();
+      if (!platform || !/^[A-Za-z0-9_-]+$/.test(platform)) {
+        return c.json({ ok: false, error: "platform 名不合法" }, 400);
+      }
+      let entries;
+      try {
+        entries = parseCookieText(body.text);
+      } catch (e) {
+        return c.json({ ok: false, error: "解析失败：" + (e?.message || e) }, 400);
+      }
+      if (!entries.length) {
+        return c.json({ ok: false, error: "没能从输入里解析出任何 cookie" }, 400);
+      }
+      for (const e of entries) {
+        for (const k of Object.keys(e)) {
+          if (!COOKIE_ENTRY_KEYS.includes(k)) delete e[k];
+        }
+      }
+      const cookiesDir = path.join(dataDir, "cookies");
+      fs.mkdirSync(cookiesDir, { recursive: true });
+      const file = path.join(cookiesDir, platform + ".json");
+      // 保留旧文件里的 headers / user（粘贴导入通常不带这些；换 cookie 不该换 UA 指纹）
+      let headers = {};
+      let user = {};
+      try {
+        const old = JSON.parse(fs.readFileSync(file, "utf-8"));
+        if (old && typeof old === "object") {
+          if (old.headers && typeof old.headers === "object") headers = old.headers;
+          if (old.user && typeof old.user === "object") user = old.user;
+        }
+      } catch { /* 没有旧文件或损坏：从零开始 */ }
+      const bundle = {
+        platform,
+        cookies: entries,
+        headers,
+        user,
+        captured_at: localStamp(),
+        source: "manual-paste",
+        expires_at: "",
+      };
+      fs.writeFileSync(file, JSON.stringify(bundle, null, 2), "utf-8");
+      cookiesCache = null;   // 登录态变了，下一轮 /intake/cookies 重查
+      return c.json({
+        ok: true,
+        action: "import",
+        platform,
+        count: entries.length,
+        names: entries.map((e) => e.name),
+      });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 导出登录态备份 ──
+  // 把某平台整份 bundle JSON 吐给卡片（前端复制到剪贴板存文件）。
+  // 恢复 = 原样粘回 /intake/login/import-cookies，同一个入口闭环。
+  // 边界：platform 正则校验（无路径分隔符），只读 cookies 目录内的文件。
+  app.get("/intake/cookies-export", async (c) => {
+    try {
+      const platform = c.req.query("platform") || "";
+      if (!/^[A-Za-z0-9_-]+$/.test(platform)) {
+        return c.json({ ok: false, error: "platform 名不合法" }, 400);
+      }
+      const file = path.join(dataDir, "cookies", platform + ".json");
+      if (!fs.existsSync(file)) {
+        return c.json({ ok: false, error: "该平台还没有登录态" }, 404);
+      }
+      return c.json({ ok: true, platform, text: fs.readFileSync(file, "utf-8") });
     } catch (e) { return fail(c, e); }
   });
 
@@ -647,6 +790,27 @@ export default function (app, ctx) {
         }
       }
       return c.json({ ok: true, logs });
+    } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 前端错误遥测（2026-10-11）──
+  // 卡片 iframe 的 console 错误外面看不到 —— 白屏排查曾只能靠猜。
+  // 前端 window.onerror/unhandledrejection 把错误 POST 到这里，落盘 ui-error.log，
+  // agent 读文件即可定位。限流在前端做（同错误只报一次）。
+  app.post("/intake/ui-error", async (c) => {
+    try {
+      const b = await c.req.json().catch(() => ({}));
+      const line = JSON.stringify({
+        at: new Date().toISOString(),
+        type: String(b.type || "error").slice(0, 40),
+        message: String(b.message || "").slice(0, 500),
+        stack: String(b.stack || "").slice(0, 2000),
+        url: String(b.url || "").slice(0, 300),
+      }) + "\n";
+      const logDir = path.join(dataDir, "logs");
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.appendFileSync(path.join(logDir, "ui-error.log"), line, "utf-8");
+      return c.json({ ok: true });
     } catch (e) { return fail(c, e); }
   });
 }
