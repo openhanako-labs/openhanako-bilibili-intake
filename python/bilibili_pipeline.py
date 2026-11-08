@@ -14,6 +14,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from whisper_hallucination_detector import detect_whisper_hallucination
+
 import yt_dlp
 
 from subtitle_parser import (
@@ -384,11 +386,24 @@ def _transcribe_faster_whisper(audio_path: Path, model_name: str, language: str,
             "end": round(float(seg.end or 0.0), 3),
             "text": piece,
         })
-    return "".join(parts).strip(), device, seg_out
+    
+    # ⭐ v0.6.71：检测 Whisper 幻觉（30s 循环短句）
+    text = "".join(parts).strip()
+    is_hallucination, confidence, explanation = detect_whisper_hallucination(seg_out)
+    if is_hallucination:
+        log(f"Whisper hallucination detected: {explanation}")
+        # 如果是幻觉，清空文本并保留空 seg_out
+        text = ""
+        seg_out = []
+    
+    return text, device, seg_out
 
 
 def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str, device_preference: str) -> tuple[str, str, list]:
-    """openai-whisper 实现（回退路径）。"""
+    """openai-whisper 实现（回退路径）。
+    
+    ⭐ v0.6.71：增加 Whisper 幻觉检测。
+    """
     import whisper
     
     device = resolve_whisper_device(device_preference, backend="openai-whisper")
@@ -410,6 +425,14 @@ def _transcribe_openai_whisper(audio_path: Path, model_name: str, language: str,
         }
         for s in (result.get("segments") or [])
     ]
+    
+    # ⭐ v0.6.71：检测 Whisper 幻觉（30s 循环短句）
+    is_hallucination, confidence, explanation = detect_whisper_hallucination(seg_out)
+    if is_hallucination:
+        log(f"Whisper hallucination detected: {explanation}")
+        text = ""
+        seg_out = []
+    
     return text, device, seg_out
 
 

@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "bilibili-intake-v2",
   "name": "内容摄取 (Bilibili Intake)",
-  "version": "0.6.70",
+  "version": "0.6.71",
   "description": "内容摄取：B站/小红书等七平台与本地文档，评论字幕入库。",
   "minAppVersion": "0.942.0",
   "entry": "index.js",
