@@ -766,8 +766,13 @@ def _handle_cookies_cli(args: argparse.Namespace) -> int:
         try:
             entries = extract_platform_cookies(platform, browser=browser)
             if not entries:
-                print(json.dumps({"ok": False,
-                                  "error": f"从 {browser} 未取到 {platform} 的 cookies（未登录或浏览器未安装）"}))
+                from cookies_store import LAST_EXTRACT_NOTES
+                notes = "；".join(LAST_EXTRACT_NOTES[:3])
+                err = f"从 {browser} 未取到 {platform} 的 cookies（未登录或浏览器未安装）"
+                if notes:
+                    err = f"未取到 {platform} 的 cookies。诊断：{notes}"
+                print(json.dumps({"ok": False, "error": err, "notes": LAST_EXTRACT_NOTES[:5]},
+                                 ensure_ascii=False))
                 return 0
             bundle = CookieBundle(platform=platform, cookies=entries, source=f"browser:{browser}")
             store.save(bundle)
@@ -814,6 +819,162 @@ def _safe_filename(name: str, maxlen: int = 80) -> str:
     return cleaned[:maxlen] if cleaned else "untitled"
 
 
+def _download_media_sources(item: dict, output_dir: Path, log) -> None:
+    """把 item["mediaSources"] 里的视频/音频落盘（帧分析与转写用）。
+
+    ⭐ 2026-11-21：这是新平台统一的「已解好的直链」契约，取代过去每个平台
+    自己写一段下载代码的做法（小红书那段硬结在下面保留当兼容）。
+
+    契约：mediaSources = [{
+        "type": "video" | "audio",
+        "url": str,          # 带时效的临时签名地址，拿到就要尽快下
+        "headers": dict,     # 必需——很多 CDN 校 Referer/UA，缺了就是 403
+        "height": int,       # 可选，用于挑最优流
+        "bytes": int,        # 可选
+    }]
+
+    分 DASH 流的平台（B站/YouTube 高清）这里会拿到两条独立链接：帧分析只要
+    video 那条，转写只要 audio 那条——**所以根本不需要合流，也就不需要 FFmpeg**。
+    """
+    import urllib.request as _ur
+
+    sources = [s for s in (item.get("mediaSources") or [])
+               if isinstance(s, dict) and str(s.get("url") or "").startswith("http")]
+    if not sources:
+        return
+
+    videos = [s for s in sources if (s.get("type") or "video") == "video"] or sources
+    # 高清优先：height → bytes → 原顺序（sort 稳定）
+    videos.sort(key=lambda s: (-int(s.get("height") or 0), -int(s.get("bytes") or 0)))
+    best = videos[0]
+
+    suffix = ".mp4"
+    url_lower = str(best["url"]).lower()
+    for cand in (".mp4", ".webm", ".mov", ".m3u8"):
+        if cand in url_lower:
+            suffix = cand
+            break
+    if suffix == ".m3u8":
+        # 分片清单不是文件，直接用会把一个文本存成 mp4（小黑盒/HLS 站点常见）
+        item["sourceVideoError"] = "该平台给的是 m3u8 分片清单，需要 ffmpeg 才能合成，当前不自动下载"
+        log("mediaSources 是 m3u8，跳过")
+        return
+
+    dst = output_dir / f"source_video{suffix}"
+    req = _ur.Request(best["url"], headers=best.get("headers") or {"User-Agent": "Mozilla/5.0"})
+    try:
+        total = 0
+        with _ur.urlopen(req, timeout=180) as resp, open(dst, "wb") as fh:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 4 * 1024 * 1024 * 1024:
+                    raise RuntimeError("超过 4GB 上限，停止下载")
+                fh.write(chunk)
+        # 空文件或 HTML 错误页要拦下来，不然帧分析会报一句莫名其妙的话
+        if total < 1024 or dst.read_bytes()[:15].lstrip().lower().startswith(b"<!doctype"):
+            raise RuntimeError(f"下载结果不像视频（{total} 字节）")
+        item["sourceVideoPath"] = str(dst)
+        item["sourceVideoBytes"] = total
+        log(f"原片已下载: {total} 字节 -> {dst.name}")
+    except Exception as exc:  # noqa: BLE001 - 下载失败不该拖垮采集
+        dst.unlink(missing_ok=True)
+        item["sourceVideoError"] = str(exc)[:200]
+        log(f"原片下载失败: {exc}")
+
+
+def _save_post_images(item: dict, output_dir: Path, log, limit: int = 30) -> None:
+    """图文帖的图片落盘（images/ + images.json）。
+
+    ⭐ 2026-11-21：图文帖是新东西——在这之前记录模型只认视频和文档，
+    多图帖进来没有地方放。这里只负责“把字节存下来 + 把真实尺寸换上
+    + 写一份索引”，至于记录怎么引用它们是 records.js 的事。
+
+    ⚠️ 平台 API 给的 width/height 不可信（小黑盒给的是缩略图显示尺寸，
+    实测 306x611，原图 1080x2156）。所以以**下载后实测**为准，测不出来才
+    退回原值。
+    """
+    import urllib.request as _ur
+
+    images = [i for i in (item.get("images") or [])
+              if isinstance(i, dict) and str(i.get("url") or "").startswith("http")]
+    if not images:
+        return
+
+    img_dir = output_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from PIL import Image  # type: ignore
+        _has_pil = True
+    except Exception:  # noqa: BLE001 - 没装 Pillow 就退化成按后缀存
+        _has_pil = False
+
+    saved: list[dict] = []
+    failed = 0
+    for idx, img in enumerate(images[:limit], 1):
+        url = str(img["url"])
+        headers = img.get("headers") or {"User-Agent": "Mozilla/5.0",
+                                         "Referer": item.get("url") or ""}
+        # 后缀先从 URL 猜，下载后再按真实格式纠正
+        ext = ".jpg"
+        for cand in (".png", ".jpeg", ".jpg", ".webp", ".gif"):
+            if cand in url.lower().split("?")[0]:
+                ext = ".jpg" if cand == ".jpeg" else cand
+                break
+        dst = img_dir / f"{idx:02d}{ext}"
+        try:
+            req = _ur.Request(url, headers=headers)
+            with _ur.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            if len(data) < 512:
+                raise RuntimeError(f"只有 {len(data)} 字节")
+            dst.write_bytes(data)
+            width, height = int(img.get("width") or 0), int(img.get("height") or 0)
+            if _has_pil:
+                try:
+                    import io
+                    with Image.open(io.BytesIO(data)) as im:
+                        width, height = im.size
+                        real_ext = (im.format or "").lower()
+                        fix = {"jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp"}.get(real_ext)
+                        if fix and fix != dst.suffix.lower():
+                            dst = dst.with_suffix(fix)
+                            dst.write_bytes(data)
+                except Exception:  # noqa: BLE001 - 尺寸读不出来就算了，不能因此丢图
+                    pass
+            saved.append({
+                "index": idx,
+                "file": dst.name,
+                "path": str(dst),
+                "bytes": len(data),
+                "width": width,
+                "height": height,
+                "caption": str(img.get("caption") or ""),
+                "sourceUrl": url,
+            })
+        except Exception as exc:  # noqa: BLE001 - 单张失败不影响其他
+            failed += 1
+            log(f"图片 {idx} 下载失败: {exc}")
+
+    if not saved:
+        item["imagesError"] = f"{failed} 张全部下载失败"
+        return
+
+    manifest_path = output_dir / "images.json"
+    manifest_path.write_text(
+        json.dumps({"total": len(saved), "failed": failed, "images": saved},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    item["imagesDir"] = str(img_dir)
+    item["imagesManifestPath"] = str(manifest_path)
+    item["imagesSaved"] = len(saved)
+    log(f"图片已保存: {len(saved)} 张（失败 {failed}）-> {img_dir.name}/")
+
+
 def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) -> int:
     """Dispatch to platform adapter (non-B站 platforms)."""
     if not _ADAPTERS_AVAILABLE:
@@ -829,7 +990,8 @@ def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) ->
             print(json.dumps({"ok": False, "error": "cannot detect platform"}, ensure_ascii=False))
             return 1
 
-    adapter = get_adapter(platform_id, cookies_file=args.cookies_file, cookies_dir=args.cookies_dir)
+    adapter = get_adapter(platform_id, cookies_file=args.cookies_file, cookies_dir=args.cookies_dir,
+                          proxy=getattr(args, "proxy", "") or "")
     if not adapter:
         log(f"no adapter for platform {platform_id}")
         print(json.dumps({"ok": False, "error": f"no adapter for {platform_id}"}))
@@ -914,7 +1076,12 @@ def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) ->
     #   每路有 masterUrl（带 sign+t 的签名地址）+ backupUrls；取 size 最大的那路。
     #   ⚠️ 必须带 Referer: https://www.xiaohongshu.com/，否则 CDN 直接 403（实测）。
     #   文件名固定 source_video.mp4 —— intake_shots 认的就是这个名字。
-    if getattr(args, "download_video", False):
+    # ⭐ 2026-11-21：有 mediaSources 就走通用落盘（小黑盒/快手/Pixiv 这些新平台）；
+    #   没有才回到下面小红书专用的老结构（xhs adapter 不产 mediaSources）。
+    if getattr(args, "download_video", False) and (item.get("mediaSources") or []):
+        _download_media_sources(item, output_dir, log)
+
+    if getattr(args, "download_video", False) and not (item.get("mediaSources") or []):
         try:
             import urllib.request as _ur
             _vinfo = (item.get("video") or {}).get("info") or {}
@@ -944,6 +1111,11 @@ def _run_via_adapter(args: argparse.Namespace, source: str, output_dir: Path) ->
         except Exception as _e:
             item["sourceVideoError"] = str(_e)[:200]
             log("xhs 原片下载失败: %s" % _e)
+    # ⭐ 2026-11-21：图文帖落图。只要 adapter 给了 images 就存，不受 download_video 控制
+    #   —— 图文帖没有图就等于什么都没有，这不该是个可选步骤。
+    if getattr(args, "with_images", True) and item.get("images"):
+        _save_post_images(item, output_dir, log)
+
     item["outputDir"] = str(output_dir)
     write_json(output_dir / "result.json", item)
 
@@ -1026,6 +1198,22 @@ def main() -> int:
         sys.stdout.write(json.dumps(status, ensure_ascii=False, indent=2))
         return 0
     if args.action == "download-video":
+        # ⭐ 2026-11-21：非 B 站平台的原片下载要走 adapter —— yt-dlp 没有快手/Pixiv/
+        #   小黑盒的 extractor，把链接丢给它是必输（实测：ERROR: Unsupported URL，
+        #   还会先跑一遍 generic extractor 白等）。adapter 那边有 mediaSources 直链，
+        #   同一套落盘逻辑在 _run_via_adapter 里。
+        _pid = args.platform
+        if _pid in ("auto", "", None):
+            try:
+                _pid = detect_platform(args.source or "") or "bilibili"
+            except Exception:  # noqa: BLE001 - 检测不了就当 B 站
+                _pid = "bilibili"
+        if _pid not in ("bilibili",):
+            # --action download-video 和 --download-video 是两个参数：前者是"动作"，
+            # 后者是"采集时顺手把原片落了"。转进 adapter 之前把后者也置上，
+            # 否则 adapter 只会采集不会下载（实测第一次就这么静静跑完了）。
+            args.download_video = True
+            return _run_via_adapter(args, args.source, output_dir)
         return _run_download_video(args, output_dir)
 
     # --- Cookies management ---
@@ -1126,7 +1314,14 @@ def main() -> int:
                 platform_id = detected
 
     # Dispatch
-    if platform_id and platform_id != "auto" and platform_id != "bilibili":
+    # ⭐ 2026-11-21：B 站图文帖（专栏 cv / 动态 opus）不是视频。走 _run_single 会被
+    #   当成一条视频去 yt-dlp 找直链，最后报 “[BiliBiliDynamic] No valid video URL found”
+    #   （实测，而且还会先把 Playwright/Scrapling 白跑一轮）。这两类直接交给 adapter。
+    _is_bili_article = bool(re.search(
+        r"/read/(?:mobile/)?cv\d+|(?:/opus/|t\.bilibili\.com/)\d{6,}",
+        source or "", re.IGNORECASE,
+    ))
+    if platform_id and platform_id != "auto" and (platform_id != "bilibili" or _is_bili_article):
         return _run_via_adapter(args, source, output_dir)
 
     # B站 pipeline

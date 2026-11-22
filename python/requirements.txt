@@ -25,3 +25,8 @@ tenacity
 aiosqlite
 jieba
 Pillow
+# ⭐ 2026-11-22：从浏览器 cookie 库里提取登录态必需。
+#   Chrome/Edge 的 cookie 是 AES-GCM（v10 格式），没有它每条都解成空字符串——
+#   而且它是**静默**失败（ImportError 被 except 吃掉），表现就是“明明登录了却取不到”。
+#   实测：App 的 venv 里没这个包，命令行用系统 python 却有，两边行为不一致。
+cryptography

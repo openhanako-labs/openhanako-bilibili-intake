@@ -31,7 +31,22 @@ _BACKENDS: dict[str, list[dict[str, Any]]] = {
     "zhihu": [{"adapter": "adapters/zhihu.py", "priority": 0, "online_check": True}],
     "tieba": [{"adapter": "adapters/tieba.py", "priority": 0, "online_check": True}],
     "douyin": [{"adapter": "adapters/douyin.py（未完整实现）", "priority": 0, "online_check": False}],
-    "kuaishou": [{"adapter": "adapters/kuaishou.py（未完整实现）", "priority": 0, "online_check": False}],
+    # ⭐ 2026-11-21：快手已真实实现（桌面页降级 → 移动页 INIT_STATE）。
+    #   online_check 设 False：health 每次跑都要访问快手一次，没必要。
+    "kuaishou": [
+        {"adapter": "adapters/kuaishou.py（移动页 INIT_STATE）", "priority": 0, "online_check": False},
+        {"adapter": "adapters/kuaishou.py（桌面页 APOLLO 兜底）", "priority": 1, "online_check": False},
+    ],
+    # ⭐ 2026-11-21：小黑盒（hkey v2 签名直连）。
+    #   online_check=False 是刻意的：这个接口有频率风控，health 一探就可能把采集自己
+    #   推进 show_captcha 冷却，得不偿失。
+    "xiaoheihe": [
+        {"adapter": "adapters/xiaoheihe.py（hkey v2 签名）", "priority": 0, "online_check": False},
+    ],
+    # ⭐ 2026-11-21：Pixiv。国内直连 pixiv.net 必超时，靠 settings.proxyUrl。
+    "pixiv": [
+        {"adapter": "adapters/pixiv.py（需代理）", "priority": 0, "online_check": False},
+    ],
 }
 
 # 失败计数，临时跳过不可用后端（300 秒冷却）
@@ -186,7 +201,10 @@ def run_health_check() -> dict[str, Any]:
                 else:
                     entry["status"] = "fail"
                     entry["http_status"] = r.status_code
-            elif platform_id in ("xhs", "weibo", "zhihu", "tieba"):
+            elif platform_id in ("xhs", "weibo", "zhihu", "tieba", "kuaishou", "xiaoheihe", "pixiv"):
+                # ⭐ 2026-11-21：快手 / 小黑盒 / Pixiv 已真实实现，不再算 stub。
+                #   它们不在这里做在线探测是刻意的：小黑盒一探就可能进风控冷却，
+                #   快手要拉整个页面，Pixiv 没代理必超时。
                 entry["status"] = "unchecked"
                 entry["note"] = "需要实际采集时才能确认可用性"
             else:

@@ -96,6 +96,18 @@ const API = {
   cookies: () => req("GET", "/intake/cookies"),
   // ⭐ 把所有平台的登录态都收成"粘贴 cookie"这一种形态（扫码在沙箱里不可能通）。
   importCookies: (platform, text) => req("POST", "/intake/login/import-cookies", { platform, text }),
+  // ⭐ 2026-11-21：浏览器登录。这条推翻了上面那句"扫码在沙箱里不可能通"——
+  //   实测 channel="chrome" 能拉起本机 Chrome 157（playwright 自带的 chromium 确实缺，
+  //   但系统 Chrome 在）。POST 只是启动，结果靠轮询 loginStatus。
+  loginBrowser: (platform) => req("POST", "/intake/login/browser", { platform }),
+  loginStatus: (platform) => req("GET", "/intake/login/status?platform=" + encodeURIComponent(platform)),
+  // ⭐ 2026-11-21（第二版）：不依赖 playwright 的路。拉起系统默认浏览器登录，
+  //   然后从浏览器 cookie 库里解密重建（Chrome 实测可用）。
+  loginOpen: (platform) => req("POST", "/intake/login/open", { platform }),
+  loginExtract: (platform, browser = "auto") => req("POST", "/intake/login/extract", { platform, browser }),
+  loginTargets: () => req("GET", "/intake/login/targets"),
+  // ⭐ 2026-11-22：登录态极速版（直读目录，不起 Python）。面板用这个。
+  loginsFast: () => req("GET", "/intake/logins-fast"),
   logout: (platform) => req("POST", "/intake/cookies-logout", { platform }),
   // 导出某平台整份登录态 bundle（备份/迁机用；恢复 = 粘回 importCookies）
   exportCookies: (platform) => req("GET", "/intake/cookies-export?platform=" + encodeURIComponent(platform)),
@@ -480,15 +492,15 @@ async function doCapture() {
   }
   const btn = $("#btn-capture");
   btn.disabled = true; btn.textContent = "采集中…";
-  const _b_capture_status = "#capture-status"; if (_b_capture_status) _b_capture_status.textContent = "正在采集 " + platName(currentPlatform) + "…";
-  const _b_capture_status_1 = "#capture-status"; if (_b_capture_status_1) _b_capture_status_1.className = "status";
+  const _b_capture_status = $("#capture-status"); if (_b_capture_status) _b_capture_status.textContent = "正在采集 " + platName(currentPlatform) + "…";
+  const _b_capture_status_1 = $("#capture-status"); if (_b_capture_status_1) _b_capture_status_1.className = "status";
   try {
     const r = await API.fetch({ source: src, platform: currentPlatform, saveRecord: true });
     // ⭐ 形状判定，不靠 r.ok：后端 collector 直返的 JSON 里没有 ok 字段
     // （search/health/cookies 都没有），靠 r.ok 会把成功当失败。
     if (!r.title && !Array.isArray(r.results)) {
       flash("#capture-status", "采集失败：" + (r.error || "响应缺少 title"), true);
-      const _b_tc_capture = "#tc-capture"; if (_b_tc_capture) _b_tc_capture.innerHTML = '<div class="empty"><div class="e-icon">!</div><div>' + esc(r.error || "响应缺少 title") + "</div></div>";
+      const _b_tc_capture = $("#tc-capture"); if (_b_tc_capture) _b_tc_capture.innerHTML = '<div class="empty"><div class="e-icon">!</div><div>' + esc(r.error || "响应缺少 title") + "</div></div>";
       return;
     }
     renderCapture(r);
@@ -566,11 +578,11 @@ async function doSearch() {
   // ⭐ 切标签后立刻给加载态。否则用户看到「搜索结果会显示在这里」
   //   以为搜索没开始或失败了——请求其实正在跑，只有顶部状态条在动。
   //   和 renderRecords 首次加载显示「加载中…」的处理一致。
-  const _b_tc_search = "#tc-search"; if (_b_tc_search) _b_tc_search.innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>搜索中…</div><div class="e-sub">在 ' + esc(platName(currentPlatform)) + ' 搜索「' + esc(kw) + '」</div></div>';
+  const _b_tc_search = $("#tc-search"); if (_b_tc_search) _b_tc_search.innerHTML = '<div class="empty"><div class="e-icon">◌</div><div>搜索中…</div><div class="e-sub">在 ' + esc(platName(currentPlatform)) + ' 搜索「' + esc(kw) + '」</div></div>';
   const btn = $("#btn-search");
   btn.disabled = true; btn.textContent = "搜索中…";
-  const _b_search_status = "#search-status"; if (_b_search_status) _b_search_status.textContent = "正在搜索 " + platName(currentPlatform) + "…";
-  const _b_search_status_1 = "#search-status"; if (_b_search_status_1) _b_search_status_1.className = "status";
+  const _b_search_status = $("#search-status"); if (_b_search_status) _b_search_status.textContent = "正在搜索 " + platName(currentPlatform) + "…";
+  const _b_search_status_1 = $("#search-status"); if (_b_search_status_1) _b_search_status_1.className = "status";
   try {
     const r = await API.search(kw, 0, 20, currentPlatform);
     const el = $("#tc-search");
@@ -992,7 +1004,7 @@ const _rf = $("#rec-filter"); if (_rf) _rf.oninput = (e) => {
 };
 
 const _brf = $("#btn-refresh"); if (_brf) _brf.onclick = () => { renderRecords(true); if ($("#tc-status").classList.contains("on")) renderStatus(); };
-const _b_btn_new_rec = "#btn-new-rec"; if (_b_btn_new_rec) _b_btn_new_rec.onclick = async () => {
+const _b_btn_new_rec = $("#btn-new-rec"); if (_b_btn_new_rec) _b_btn_new_rec.onclick = async () => {
   // ⭐ 旧写法 prompt 链只判了第一步：任意后续一步取消（返回 null），
   //   后面的 prompt 仍会连着弹完。而且保存时不带 platform，
   //   记录的平台字段会丢、canonical id 退化，同一个视频又变两条。
@@ -1008,14 +1020,14 @@ const _b_btn_new_rec = "#btn-new-rec"; if (_b_btn_new_rec) _b_btn_new_rec.onclic
   flash("#rec-status", r.ok ? "已记录" : "记录失败：" + (r.error || ""), !r.ok);
   renderRecords();
 };
-const _b_btn_trash = "#btn-trash"; if (_b_btn_trash) _b_btn_trash.onclick = async () => {
+const _b_btn_trash = $("#btn-trash"); if (_b_btn_trash) _b_btn_trash.onclick = async () => {
   const t = await API.trash();
   if (!t.ok) return flash("#rec-status", "读缓冲失败：" + (t.error || ""), true);
   if (!t.count) return flash("#rec-status", "缓冲是空的", false);
   const names = (t.items || []).slice(0, 6).map(i => `${i.day}/${i.slot}`).join("、");
   flash("#rec-status", `缓冲：${t.count} 个槽位的留档（${(t.bytes / 1048576).toFixed(1)} MB）— ${names}${t.count > 6 ? " 等" : ""}`, false);
 };
-const _b_btn_trash_empty = "#btn-trash-empty"; if (_b_btn_trash_empty) _b_btn_trash_empty.onclick = async () => {
+const _b_btn_trash_empty = $("#btn-trash-empty"); if (_b_btn_trash_empty) _b_btn_trash_empty.onclick = async () => {
   if (!(await askConfirm("彻底清空删除缓冲？里面的总结留档将不可恢复。"))) return;
   const d = await API.emptyTrash();
   flash("#rec-status", d.ok ? `缓冲已清空（${d.removed} 个槽位）` : "清空失败：" + (d.error || ""), !d.ok);
@@ -1039,20 +1051,20 @@ function bulkInvert() {
   updateBulkInfo();
   renderRecords();
 }
-const _b_btn_bulk_all = "#btn-bulk-all"; if (_b_btn_bulk_all) _b_btn_bulk_all.onclick = bulkToggleAll;
-const _b_btn_bulk_inv = "#btn-bulk-inv"; if (_b_btn_bulk_inv) _b_btn_bulk_inv.onclick = bulkInvert;
+const _b_btn_bulk_all = $("#btn-bulk-all"); if (_b_btn_bulk_all) _b_btn_bulk_all.onclick = bulkToggleAll;
+const _b_btn_bulk_inv = $("#btn-bulk-inv"); if (_b_btn_bulk_inv) _b_btn_bulk_inv.onclick = bulkInvert;
 
-const _b_btn_bulk = "#btn-bulk"; if (_b_btn_bulk) _b_btn_bulk.onclick = () => {
+const _b_btn_bulk = $("#btn-bulk"); if (_b_btn_bulk) _b_btn_bulk.onclick = () => {
   bulkMode = !bulkMode;
   if (!bulkMode) pickedIds.clear();
-  const _b_btn_bulk_1 = "#btn-bulk"; if (_b_btn_bulk_1) _b_btn_bulk_1.textContent = bulkMode ? "取消选择" : "批量选择";
+  const _b_btn_bulk_1 = $("#btn-bulk"); if (_b_btn_bulk_1) _b_btn_bulk_1.textContent = bulkMode ? "取消选择" : "批量选择";
   // 全选/反选只在批量模式下出现（非批量模式下它们是噪音）
   { const x = $("#btn-bulk-all"); if (x) x.hidden = !bulkMode; }
   { const x = $("#btn-bulk-inv"); if (x) x.hidden = !bulkMode; }
   updateBulkInfo();
   renderRecords();
 };
-const _b_btn_bulk_del = "#btn-bulk-del"; if (_b_btn_bulk_del) _b_btn_bulk_del.onclick = async () => {
+const _b_btn_bulk_del = $("#btn-bulk-del"); if (_b_btn_bulk_del) _b_btn_bulk_del.onclick = async () => {
   const ids = [...pickedIds];
   if (!ids.length) return flash("#rec-status", "还没选记录", true);
   const sumCount = lastItems.filter(x => ids.includes(x.id) && x.summary).length;
@@ -1069,7 +1081,7 @@ const _b_btn_bulk_del = "#btn-bulk-del"; if (_b_btn_bulk_del) _b_btn_bulk_del.on
 
 // ⭐ 2026-10-04：批量补写总结。历史里 22 条只有 1 条有总结（自动总结从未成功过），
 //   一两条点得完，二十多条不可能。已有总结的跳过，不拿旧摘要去占模型调用。
-const _b_btn_bulk_sum = "#btn-bulk-sum"; if (_b_btn_bulk_sum) _b_btn_bulk_sum.onclick = async () => {
+const _b_btn_bulk_sum = $("#btn-bulk-sum"); if (_b_btn_bulk_sum) _b_btn_bulk_sum.onclick = async () => {
   const ids = [...pickedIds];
   if (!ids.length) return flash("#rec-status", "还没选记录", true);
   const targets = lastItems.filter(x => ids.includes(x.id) && !x.summary);
@@ -1091,8 +1103,8 @@ const _b_btn_bulk_sum = "#btn-bulk-sum"; if (_b_btn_bulk_sum) _b_btn_bulk_sum.on
   updateBulkInfo();
   setTimeout(() => renderRecords(true), 1500);
 };
-const _b_confirm_yes = "#confirm-yes"; if (_b_confirm_yes) _b_confirm_yes.onclick = () => closeConfirm(true);
-const _b_confirm_no = "#confirm-no"; if (_b_confirm_no) _b_confirm_no.onclick = () => closeConfirm(false);
+const _b_confirm_yes = $("#confirm-yes"); if (_b_confirm_yes) _b_confirm_yes.onclick = () => closeConfirm(true);
+const _b_confirm_no = $("#confirm-no"); if (_b_confirm_no) _b_confirm_no.onclick = () => closeConfirm(false);
 
 // ── 画面分析报告：点「报告」→ 弹窗里内嵌整页 ──
 //   报告是自包含的单文件 HTML（样式内联），所以用 srcdoc 而不是 iframe src ——
@@ -1181,8 +1193,8 @@ async function __loadReport(shotDir, shownPath) {
   const frame = $("#report-frame");
   if (frame) frame.removeAttribute("srcdoc");
 }
-const _b_report_close = "#report-close"; if (_b_report_close) _b_report_close.onclick = closeReport;
-const _b_report_modal = "#report-modal"; if (_b_report_modal) _b_report_modal.onclick = (e) => { if (e.target === $("#report-modal")) closeReport(); };
+const _b_report_close = $("#report-close"); if (_b_report_close) _b_report_close.onclick = closeReport;
+const _b_report_modal = $("#report-modal"); if (_b_report_modal) _b_report_modal.onclick = (e) => { if (e.target === $("#report-modal")) closeReport(); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeReport(); });
 
 // 事件代理：记录列表会被整体重建（innerHTML），逐个绑定会在下一轮轮询后失效。
@@ -1257,6 +1269,271 @@ $("#btn-logout") && ($("#btn-logout").onclick = async () => {
 function cookiesStale() {
   const st = $("#status-panel");
   if (st) st.dataset.loaded = "";
+}
+
+// ── 浏览器登录面板（2026-11-21）──
+//
+// 目标：点「登录」→ 选平台 → 弹一个真浏览器窗口停在登录页 → 扫码 → 窗口自己关
+// → cookie 自动存进 <dataDir>/cookies/<platform>.json。
+//
+// 这里刻意保留「粘贴 cookie」当备选（同一个面板底部）：如果哪天系统 Chrome 升级把
+// playwright 的 channel 路径改了，浏览器登录会失败，但粘贴永远能用。
+const LOGIN_PLATFORMS = [
+  ["bilibili", "哔哩哔哩"],
+  ["xhs", "小红书"],
+  ["weibo", "微博"],
+  ["zhihu", "知乎"],
+  ["tieba", "百度贴吧"],
+  ["kuaishou", "快手"],
+  ["xiaoheihe", "小黑盒"],
+];
+
+let _loginPanel = null;
+let _loginPollTimer = null;
+
+function ensureLoginPanel() {
+  if (_loginPanel && document.body.contains(_loginPanel)) return _loginPanel;
+  const panel = document.createElement("div");
+  panel.id = "login-panel";
+  panel.style.cssText = "position:fixed;top:54px;right:16px;z-index:9999;width:340px;"
+    + "max-height:70vh;overflow:auto;background:var(--card,#fff);border:1px solid var(--line-s,#ddd);"
+    + "border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.16);padding:12px;font-size:12.5px;";
+  document.body.appendChild(panel);
+  _loginPanel = panel;
+  return panel;
+}
+
+function closeLoginPanel() {
+  if (_loginPollTimer) { clearInterval(_loginPollTimer); _loginPollTimer = null; }
+  if (_loginPanel) { _loginPanel.remove(); _loginPanel = null; }
+}
+
+async function refreshLoginPanel() {
+  const panel = ensureLoginPanel();
+  panel.innerHTML = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'
+    + '<b style="font-size:13px">登录平台</b>'
+    + '<span style="color:var(--ink-3);font-size:11px">浏览器登录：点一下，窗口里扫码</span>'
+    + '<span style="flex:1"></span>'
+    + '<button id="login-panel-close" style="border:none;background:transparent;cursor:pointer;font-size:15px;color:var(--ink-3)">×</button>'
+    + '</div>'
+    + '<div id="login-rows"></div>';
+  panel.querySelector("#login-panel-close").onclick = closeLoginPanel;
+
+  // ⭐ 2026-11-22：先画再填。
+  //   旧写法是 `await API.cookies()` 之后才开始建行——而 /intake/cookies 要起一次
+  //   Python（冷启动 + 七个平台扫描），慢的时候面板就只剩一个标题挂在那儿，
+  //   看起来就是“点了没反应”。现在先把七行画出来（状态写“检查中…”），再异步补。
+  const holder = panel.querySelector("#login-rows");
+  const stateEls = new Map();
+  const btnEls = new Map();
+
+  for (const [pid, name] of LOGIN_PLATFORMS) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line,#eee)";
+    row.innerHTML = '<span class="lp-dot" style="width:8px;height:8px;border-radius:50%;flex:none;background:#ccc"></span>'
+      + '<span style="width:70px;flex:none">' + esc(name) + '</span>'
+      + '<span class="lp-state" style="flex:1;color:var(--ink-3);font-size:11px">检查中…</span>';
+    const btn = document.createElement("button");
+    btn.textContent = "登录";
+    btn.style.cssText = "padding:3px 10px;border:1px solid var(--accent-line,#c9b89a);border-radius:6px;"
+      + "background:transparent;color:var(--ink);cursor:pointer;font-size:11.5px";
+    btn.onclick = () => startSystemLogin(pid, name, row, btn);
+    row.appendChild(btn);
+
+    const paste = document.createElement("button");
+    paste.textContent = "粘贴";
+    paste.title = "浏览器登录不通时的备选：直接粘 cookie";
+    paste.style.cssText = "padding:3px 8px;border:1px solid var(--line-s,#ddd);border-radius:6px;"
+      + "background:transparent;color:var(--ink-3);cursor:pointer;font-size:11.5px";
+    paste.onclick = () => { closeLoginPanel(); showCookieBox(pid); };
+    row.appendChild(paste);
+
+    holder.appendChild(row);
+    stateEls.set(pid, row.querySelector(".lp-state"));
+    btnEls.set(pid, btn);
+  }
+
+  const tip = document.createElement("div");
+  tip.style.cssText = "margin-top:10px;color:var(--ink-3);font-size:11px;line-height:1.6";
+  tip.textContent = "点「登录」会用默认浏览器打开登录页（不额外装东西）；"
+    + "登录好后回来点「读 cookie」，自动从 Chrome/Edge/其他 Chromium 系里找。"
+    + "如果浏览器开着锁住了 cookie 库，关掉它会自动继续。";
+  panel.appendChild(tip);
+
+  // 异步补状态——最多等 10 秒，拿不到就按“未登录”画，不能让面板空着
+  let logins = [];
+  try {
+    const r = await Promise.race([
+      API.loginsFast(),
+      new Promise((res) => setTimeout(() => res({ ok: false, error: "timeout" }), 4000)),
+    ]);
+    logins = (r && r.logins) || [];
+  } catch { /* 拿不到就当全未登录 */ }
+
+  const loggedIn = new Set(logins.filter((x) => x && x.logged_in).map((x) => x.platform));
+  for (const [pid] of LOGIN_PLATFORMS) {
+    const st = stateEls.get(pid);
+    const btn = btnEls.get(pid);
+    if (!st) continue;
+    const ok = loggedIn.has(pid);
+    st.textContent = ok ? "已登录" : "未登录";
+    st.style.color = ok ? "#3f8f57" : "var(--ink-3)";
+    const dot = st.parentElement.querySelector(".lp-dot");
+    if (dot) dot.style.background = ok ? "#3f8f57" : "#ccc";
+    if (btn) btn.textContent = ok ? "重登" : "登录";
+  }
+}
+
+// ── 系统浏览器登录（不依赖 playwright，2026-11-21 第二版）──
+//
+// 为什么推翻了上一版的 playwright 方案：在 App 的 Python 子进程里它起不了浏览器
+// （卡片上实际报的就是 chromium 缺失），而用户机器上 Chrome 就在那儿。
+// 现在分两步，每步都只做一件事：
+//   ① 拉起系统默认浏览器停在登录页（用户熟悉的环境，不用重复登录）
+//   ② 从浏览器 cookie 库里解密重建（python/cookies_store.py 的 DPAPI 路径）
+async function startSystemLogin(pid, name, row, btn) {
+  const state = row.querySelector(".lp-state");
+  btn.disabled = true;
+  btn.textContent = "打开中";
+  if (state) { state.textContent = "正在打开浏览器…"; state.style.color = "var(--accent,#8a6a3b)"; }
+
+  let r = null;
+  try {
+    // 加超时：后端就算卡住，也不能让按钮永远停在“打开中”
+    r = await Promise.race([
+      API.loginOpen(pid),
+      new Promise((res) => setTimeout(() => res({ ok: false, error: "请求超时（3s）" }), 3000)),
+    ]);
+  } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+
+  btn.disabled = false;
+  if (!r || !r.ok) {
+    if (state) { state.textContent = "打不开：" + ((r && r.error) || "未知"); state.style.color = "#b44"; }
+    btn.textContent = "重试";
+    return;
+  }
+
+  btn.textContent = "读 cookie";
+  btn.onclick = () => extractFromBrowser(pid, name, row, btn);
+  if (state) {
+    state.textContent = "已在浏览器打开，登录好后点「读 cookie」";
+    state.style.color = "var(--accent,#8a6a3b)";
+  }
+}
+
+async function extractFromBrowser(pid, name, row, btn) {
+  const state = row.querySelector(".lp-state");
+  btn.disabled = true;
+  btn.textContent = "读取中";
+  if (state) { state.textContent = "正在从浏览器读 cookie…"; state.style.color = "var(--accent,#8a6a3b)"; }
+
+  // ⭐ 2026-11-22：浏览器开着的时候，它的 cookie 库是**独占锁**（实测 Edge：
+  //   FILE_SHARE_READ|WRITE|DELETE 三种共享位全部 GetLastError=32），谁读都读不了。
+  //   所以这里改成“等你关掉”——每 2 秒重试一次，最多 50 秒。
+  //   用户只要把 Edge 关掉，这边自动就接上了，不用再点一次。
+  const MAX_TRIES = 8;
+  for (let attempt = 0; attempt < MAX_TRIES; attempt++) {
+    let r = null;
+    try {
+      r = await Promise.race([
+        API.loginExtract(pid, "auto"),
+        new Promise((res) => setTimeout(() => res({ ok: false, error: "请求超时" }), 25_000)),
+      ]);
+    } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+
+    if (r && r.ok) {
+      btn.disabled = false;
+      btn.textContent = "重登";
+      btn.onclick = () => startSystemLogin(pid, name, row, btn);
+      if (state) {
+        state.textContent = "已登录（" + (r.count || 0) + " 条 cookie）";
+        state.style.color = "#3f8f57";
+      }
+      try { await refreshLoginState(true); } catch { /* 旧界面 */ }
+      try { await refreshAll(); } catch { /* 同上 */ }
+      return;
+    }
+
+    const err = String((r && r.error) || "");
+    const busy = /占用|关闭/.test(err);
+    if (!busy) {
+      btn.disabled = false;
+      btn.textContent = "再试";
+      if (state) { state.textContent = err.slice(0, 60) || "没取到 cookie"; state.style.color = "#b44"; }
+      return;
+    }
+
+    if (state) {
+      state.textContent = `浏览器占用着 cookie 库，关掉它后会自动继续… ${Math.round((attempt + 1) * 2.5)}s`;
+      state.style.color = "var(--accent,#8a6a3b)";
+    }
+    await new Promise((res) => setTimeout(res, 2500));
+  }
+
+  btn.disabled = false;
+  btn.textContent = "再试";
+  if (state) {
+    state.textContent = "等了 20 秒仍被占用：把浏览器完全退出（含后台进程）再点一次";
+    state.style.color = "#b44";
+  }
+}
+
+async function startBrowserLogin(pid, name, row, btn) {
+  const state = row.querySelector(".lp-state");
+  btn.disabled = true;
+  btn.textContent = "启动中";
+  if (state) { state.textContent = "正在启动浏览器…"; state.style.color = "var(--accent,#8a6a3b)"; }
+
+  let r = null;
+  try { r = await API.loginBrowser(pid); }
+  catch (e) { r = { ok: false, error: String(e && e.message || e) }; }
+  if (!r || !r.ok) {
+    if (state) { state.textContent = "启动失败：" + ((r && r.error) || "未知"); state.style.color = "#b44"; }
+    btn.disabled = false;
+    btn.textContent = "重试";
+    return;
+  }
+
+  btn.textContent = "等待扫码";
+  if (state) { state.textContent = "浏览器已打开，请在其中登录 " + name + "…"; state.style.color = "var(--accent,#8a6a3b)"; }
+
+  // 轮询：最长等 200 秒（脚本自己 180 秒超时，留点余量）
+  const deadline = Date.now() + 200_000;
+  if (_loginPollTimer) clearInterval(_loginPollTimer);
+  _loginPollTimer = setInterval(async () => {
+    if (Date.now() > deadline) {
+      clearInterval(_loginPollTimer); _loginPollTimer = null;
+      if (state) { state.textContent = "等待超时（窗口可能还开着，你可以手动关掉它）"; state.style.color = "#b44"; }
+      btn.disabled = false; btn.textContent = "重试";
+      return;
+    }
+    let s = null;
+    try { s = await API.loginStatus(pid); } catch { return; }
+    if (!s || s.status === "running" || s.status === "idle") return;
+
+    clearInterval(_loginPollTimer); _loginPollTimer = null;
+    btn.disabled = false;
+    if (s.status === "ok") {
+      const cnt = (s.result && s.result.count) || 0;
+      btn.textContent = "重登";
+      if (state) { state.textContent = "已登录（" + cnt + " 条 cookie）"; state.style.color = "#3f8f57"; }
+      // 让状态点和记录列表都反映新登录态
+      try { await refreshLoginState(true); } catch { /* 旧界面没有这个函数 */ }
+      try { await refreshAll(); } catch { /* 同上 */ }
+    } else {
+      const err = (s.result && (s.result.error || s.result.reason)) || "登录失败";
+      btn.textContent = "重试";
+      if (state) { state.textContent = String(err).slice(0, 60); state.style.color = "#b44"; }
+    }
+  }, 2000);
+}
+
+const _btnLoginOpen = $("#btn-login-open");
+if (_btnLoginOpen) {
+  _btnLoginOpen.onclick = () => {
+    if (_loginPanel) { closeLoginPanel(); return; }
+    refreshLoginPanel();
+  };
 }
 
 // ── 手动粘贴登录 cookie（2026-09-26）──

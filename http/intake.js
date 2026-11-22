@@ -17,8 +17,11 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+// ⭐ 2026-11-21：登录链路要"启动一个长时间存在的子进程立刻返回"，
+//   runCollectorArgs 是等待型（会阻塞成分钟级）。
+import { spawn } from "node:child_process";
 import { getSettings } from "../lib/settings.js";
-import { prepareRuntime, runCollector, runCollectorArgs } from "../lib/runtime.js";
+import { getVenvPython, prepareRuntime, runCollector, runCollectorArgs } from "../lib/runtime.js";
 // ⭐ 2026-09-22：记录读写抽到共享实现（卡片侧与模型工具侧同一份）。
 import { backfillFromCaptures, canonicalId, listRecords, patchFromResult, readRecords, reconcileSummaries, recordsStamp, upsertRecord, writeRecords } from "../lib/records.js";
 // ⭐ W3（2026-09-26）：删除（记录 + 本地产物）与缓冲。
@@ -36,6 +39,44 @@ import { writeArtifact } from "../lib/artifacts.js";
  */
 const RUNTIME_TTL_MS = 60_000;
 let runtimeCache = null;
+
+/**
+ * 起一个 Python 进程收集 stdout，并从里面挑出第一行能解析的 JSON。
+ *
+ * ⭐ 2026-11-21：登录链路的两个辅助端点（取平台清单 / 探 browser_login）
+ *   跑的不是 collector.py，runCollectorArgs 用不上。这里只做一件事：
+ *   把“跑个脚本、拿最后那条 JSON”包成 Promise。
+ */
+function runPythonCapture(pythonExe, args, timeoutMs = 20_000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    let child;
+    try {
+      child = spawn(pythonExe, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch (err) {
+      return done({ ok: false, error: String(err?.message || err) });
+    }
+    let out = "";
+    let errText = "";
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* 已退出 */ }
+      done({ ok: false, error: `超时（${timeoutMs}ms）` });
+    }, timeoutMs);
+    child.stdout?.on("data", (d) => { out += String(d); });
+    child.stderr?.on("data", (d) => { errText += String(d); });
+    child.on("error", (e) => { clearTimeout(timer); done({ ok: false, error: String(e?.message || e) }); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      for (const line of out.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t.startsWith("{") || !t.endsWith("}")) continue;
+        try { return done(JSON.parse(t)); } catch { /* 不是 JSON 行 */ }
+      }
+      done({ ok: false, error: (out || errText || `退出码 ${code}`).slice(-400) });
+    });
+  });
+}
 
 // ⭐ v0.6.17：health 会起 Python 探 torch，实测冷启动 5.9s / 命中 runtime 缓存后仍 3.4s
 //（health 这个 action 自己就在探）。卡片点「状态」tab 才调它，不该每次白等。
@@ -66,7 +107,22 @@ export function invalidateRuntimeCache() {
 async function runJson(ctx, args, { label, timeoutMs, inputPaths } = {}) {
   const runtime = await runtimeFor(ctx);
   const { stdout } = await runCollectorArgs(runtime, args, { label, timeoutMs, inputPaths });
-  return JSON.parse(String(stdout).trim());
+  const text = String(stdout || "");
+  try {
+    return JSON.parse(text.trim());
+  } catch {
+    // ⭐ 2026-11-22：Python 侧某一行 print 忘了写 stderr（实测：cookies_store 的两行
+    //   "User Data 目录未找到"），stdout 就被诊断文字污染，整段 JSON.parse 直接抛，
+    //   前端只看到一句 `Unexpected token 'c'`——既看不出哪个平台失败，也不知道为什么。
+    //   已经把那几行改成 stderr 了；这里再加一道：从后往前找第一条可解析的 JSON 行。
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line.startsWith("{") && !line.startsWith("[")) continue;
+      try { return JSON.parse(line); } catch { /* 不完整，继续往前 */ }
+    }
+    throw new Error(`${label || "collector"} 的输出不是 JSON：${text.slice(0, 200)}`);
+  }
 }
 
 /**
@@ -433,6 +489,238 @@ export default function (app, ctx) {
         detail: parsed.status >= 200 && parsed.status < 300 ? "" : String(parsed.body || "").slice(0, 300),
       });
     } catch (e) { return fail(c, e); }
+  });
+
+  // ── API: 浏览器登录（点按钮 → 弹窗 → 扫码 → 自动存 cookie）──
+  //
+  // ⭐ 2026-11-21：之前的登录只有两条路——命令行 `--login <platform>`（同步阻塞到
+  //   用户扫码完）和"粘贴 cookie"。卡片上没有一个能直接用的按钮。
+  //   这里补上第三条：后台跑 python/browser_login.py，立刻返回，前端轮询状态。
+  //
+  // 为什么不在 HTTP 请求里等：扫码是人的动作，最长 180s，等在里面就是一次必超时的请求。
+  const loginJobs = new Map();
+
+  app.post("/intake/login/browser", async (c) => {
+    let body = {};
+    try { body = await c.req.json(); } catch { body = {}; }
+    const platform = String(body.platform || "").trim();
+    if (!platform) return c.json({ ok: false, error: "缺少 platform" }, 400);
+
+    const running = loginJobs.get(platform);
+    if (running && running.status === "running") {
+      return c.json({ ok: true, platform, status: "running", alreadyRunning: true });
+    }
+
+    const dataDir = ctx.dataDir || path.join(ctx.pluginDir, ".data");
+    const cookiesDir = path.join(dataDir, "cookies");
+    const stateDir = path.join(dataDir, "login-state");
+    try { fs.mkdirSync(stateDir, { recursive: true }); } catch { /* 权限问题留到 spawn 报 */ }
+
+    const timeout = Number(body.timeout) > 0 ? Math.min(Number(body.timeout), 600) : 180;
+
+    let runtime;
+    try { runtime = await runtimeFor(ctx); }
+    catch (err) { return c.json({ ok: false, error: `Python 运行时不可用：${String(err?.message || err)}` }, 500); }
+
+    const pythonExe = getVenvPython(runtime);
+    const script = path.join(ctx.pluginDir, "python", "browser_login.py");
+    if (!fs.existsSync(script)) return c.json({ ok: false, error: `缺失登录脚本：${script}` }, 500);
+
+    const job = { platform, status: "running", startedAt: Date.now(), result: null, output: "" };
+    loginJobs.set(platform, job);
+
+    let child;
+    try {
+      child = spawn(pythonExe, [
+        script, platform,
+        "--cookies-dir", cookiesDir,
+        "--state-dir", stateDir,
+        "--timeout", String(timeout),
+      ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch (err) {
+      job.status = "failed";
+      job.result = { ok: false, error: `无法启动登录进程：${String(err?.message || err)}` };
+      return c.json({ ok: false, error: job.result.error }, 500);
+    }
+
+    const collect = (chunk) => { job.output = (job.output + String(chunk)).slice(-4000); };
+    child.stdout?.on("data", collect);
+    child.stderr?.on("data", collect);
+    child.on("error", (err) => {
+      job.status = "failed";
+      job.result = { ok: false, error: `登录进程出错：${String(err?.message || err)}` };
+    });
+    child.on("close", (code) => {
+      // 脚本最后一行是 JSON。只认能解析的最后一条，避免把中间日志误当结果。
+      let parsed = null;
+      for (const line of String(job.output).split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t.startsWith("{") || !t.endsWith("}")) continue;
+        try { parsed = JSON.parse(t); } catch { /* 不是 JSON 行，跳过 */ }
+      }
+      job.result = parsed || { ok: false, error: `登录进程退出（code=${code}），无结构化结果`, tail: job.output.slice(-600) };
+      job.status = job.result.ok ? "ok" : "failed";
+      cookiesCache = null; // 登录成功要立刻反映到 cookies 列表
+    });
+
+    return c.json({ ok: true, platform, status: "running", timeout });
+  });
+
+  app.get("/intake/login/status", async (c) => {
+    const platform = String(c.req.query("platform") || "").trim();
+    if (!platform) return c.json({ ok: false, error: "缺少 platform" }, 400);
+    const job = loginJobs.get(platform);
+    if (!job) return c.json({ ok: true, platform, status: "idle" });
+    return c.json({
+      ok: true,
+      platform,
+      status: job.status,
+      elapsed: Math.round((Date.now() - job.startedAt) / 1000),
+      result: job.result,
+    });
+  });
+
+  // ── API: 系统浏览器登录（不依赖 playwright）──
+  //
+  // ⭐ 2026-11-21：playwright 那条路在 App 的 Python 子进程里起不来浏览器（卡片上
+  //   实际报的就是 chromium 缺失）。而用户机器上 Chrome 就在那儿，且人已经登过了。
+  //   所以换成两步：
+  //     ① /intake/login/open   —— 命令行拉起系统默认浏览器，停在登录页
+  //     ② /intake/login/extract —— 从浏览器的 cookie 库里直接解密重建
+  //   没有任何自动化依赖：cookie 本来就是浏览器存在磁盘上的东西，我们有解密实现
+  //   （python/cookies_store.py 的 DPAPI 路径，实测 Chrome 157 可用，bilibili 拿到 23 条）。
+  //
+  // 平台清单与登录地址一律问 Python（browser_login.py 无参输出 JSON），不在 Node 里再写一份。
+  // ⭐ 2026-11-22：登录地址直接写在这里。
+  //   之前为了“单一事实源”去起一个 Python 读 browser_login.py 的输出，
+  //   代价是点一下要等一两秒才弹浏览器（用户看到的就是“打开中…”一直转）。
+  //   为了七行常量起一个解释器，这是错的取舍。
+  //   python/browser_login.py 的 LOGIN_TARGETS 仍是真相，这里只是快照；
+  //   改那边时顺手改这里（两边都是七行，漂了一眼就能看出来）。
+  const LOGIN_URLS = {
+    bilibili: { name: "啤哩啤哩", url: "https://passport.bilibili.com/login" },
+    xhs:      { name: "小红书",   url: "https://www.xiaohongshu.com/explore" },
+    weibo:    { name: "微博",     url: "https://weibo.com/login.php" },
+    zhihu:    { name: "知乎",     url: "https://www.zhihu.com/signin" },
+    tieba:    { name: "百度贴吧", url: "https://tieba.baidu.com/" },
+    kuaishou: { name: "快手",     url: "https://www.kuaishou.com/" },
+    xiaoheihe:{ name: "小黑盒",   url: "https://www.xiaoheihe.cn/" },
+  };
+
+  let loginTargetsCache = null;
+  const LOGIN_TARGETS_TTL_MS = 600_000;
+
+  async function loginTargets(ctx) {
+    const now = Date.now();
+    if (loginTargetsCache && now - loginTargetsCache.at < LOGIN_TARGETS_TTL_MS) {
+      return loginTargetsCache.value;
+    }
+    const runtime = await runtimeFor(ctx);
+    const pythonExe = getVenvPython(runtime);
+    const script = path.join(ctx.pluginDir, "python", "browser_login.py");
+    const out = await runPythonCapture(pythonExe, [script], 20_000);
+    const value = out && out.ok && out.targets ? out.targets : {};
+    loginTargetsCache = { at: now, value };
+    return value;
+  }
+
+  app.get("/intake/login/targets", async (c) => {
+    try {
+      const targets = await loginTargets(ctx);
+      return c.json({ ok: true, targets });
+    } catch (err) {
+      return c.json({ ok: false, error: String(err?.message || err) }, 500);
+    }
+  });
+
+  // ── API: 登录态的极速版（直读目录，不起 Python）──
+  //
+  // ⭐ 2026-11-22：/intake/cookies 要起一个 collector.py 跑 --list-logins。
+  //   命令行里它只要 0.57 秒，但经过宿主路由 + 冷启动，面板上就是“检查中…”挂很久。
+  //   而登录面板其实只需要两个字段：哪个平台、有没有 cookie 文件。
+  //   目录一读就是毫秒级。
+  app.get("/intake/logins-fast", async (c) => {
+    const dataDir = ctx.dataDir || path.join(ctx.pluginDir, ".data");
+    const dir = path.join(dataDir, "cookies");
+    const logins = [];
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith(".json")) continue;
+        const platform = f.slice(0, -5);
+        let count = 0;
+        let capturedAt = "";
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
+          count = Array.isArray(j.cookies) ? j.cookies.length : 0;
+          capturedAt = j.captured_at || "";
+        } catch { /* 文件坏了就当 0 条 */ }
+        logins.push({ platform, logged_in: count > 0, cookies_count: count, captured_at: capturedAt });
+      }
+    } catch { /* 目录不存在 = 全部未登录 */ }
+    return c.json({ ok: true, logins, _fast: true });
+  });
+
+  app.post("/intake/login/open", async (c) => {
+    let body = {};
+    try { body = await c.req.json(); } catch { body = {}; }
+    const platform = String(body.platform || "").trim();
+    if (!platform) return c.json({ ok: false, error: "缺少 platform" }, 400);
+
+    // 本地表直接查——不起 Python，不等网络
+    const target = LOGIN_URLS[platform];
+    if (!target || !target.url) return c.json({ ok: false, error: `未知平台：${platform}` }, 400);
+
+    try {
+      if (process.platform === "win32") {
+        // start 第一个参数是窗口标题，必须留空，否则带 & 的 URL 会被拆成多个参数
+        spawn("cmd.exe", ["/c", "start", "", target.url], {
+          windowsVerbatimArguments: true, windowsHide: true, detached: true, stdio: "ignore",
+        }).unref();
+      } else if (process.platform === "darwin") {
+        spawn("open", [target.url], { detached: true, stdio: "ignore" }).unref();
+      } else {
+        spawn("xdg-open", [target.url], { detached: true, stdio: "ignore" }).unref();
+      }
+    } catch (err) {
+      return c.json({ ok: false, error: `打不开浏览器：${String(err?.message || err)}` }, 500);
+    }
+
+    return c.json({ ok: true, platform, url: target.url, name: target.name });
+  });
+
+  app.post("/intake/login/extract", async (c) => {
+    let body = {};
+    try { body = await c.req.json(); } catch { body = {}; }
+    const platform = String(body.platform || "").trim();
+    const browser = String(body.browser || "auto").trim();
+    if (!platform) return c.json({ ok: false, error: "缺少 platform" }, 400);
+
+    const dataDir = ctx.dataDir || path.join(ctx.pluginDir, ".data");
+    const cookiesDir = path.join(dataDir, "cookies");
+
+    let out = null;
+    try {
+      // ⚠️ 超时必须低于宿主路由封顶（30s）——超了宿主会直接回纯文本
+      //   `HTTP 500: Internal Server Error`，前端根本看不到真正的错误。
+      out = await runJson(ctx, ["--extract-cookies", `${platform}:${browser}`, "--cookies-dir", cookiesDir],
+        { label: "cookies-extract", timeoutMs: 20_000 });
+    } catch (err) {
+      return c.json({ ok: false, error: `提取失败：${String(err?.message || err)}` }, 200);
+    }
+    cookiesCache = null; // 提取成功要立刻反映到 cookies 列表
+
+    if (out && out.ok) {
+      return c.json({ ok: true, platform, browser, count: out.count || 0 });
+    }
+    // ⚠️ 失败也返回 200：让前端能拿到 JSON 里的 error 字段。
+    //   之前返回 500，前端只能看到宿主包装后的纯文本。
+    return c.json({
+      ok: false,
+      platform,
+      browser,
+      error: (out && out.error) || "没取到 cookie：浏览器里可能还没登录这个平台，或浏览器不是 " + browser,
+      notes: (out && out.notes) || [],
+    });
   });
 
   // ── API: Cookies 状态 ──

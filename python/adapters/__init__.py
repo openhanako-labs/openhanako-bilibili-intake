@@ -99,11 +99,16 @@ class PlatformAdapter:
     # If no cookies are provided, only public/search results will work.
     needs_login_for_full: bool = True
 
-    def __init__(self, cookies_file: str = "", cookies_dir: str = "", http_client: Any | None = None):
+    def __init__(self, cookies_file: str = "", cookies_dir: str = "", http_client: Any | None = None,
+                 proxy: str = ""):
         self.cookies_file = cookies_file
         self.cookies_dir = cookies_dir
         self._http = http_client  # may be None; adapters create their own
         self._cookies: dict[str, str] = {}
+        # ⭐ 2026-11-21：出网代理。Pixiv / X / YouTube / Instagram 在国内直连必超时
+        #   （实测 pixiv.net 直接 WinError 10060）。adapter 自己决定怎么用它 ——
+        #   国内平台（B站/抖音/快手/小红书/小黑盒）走代理反而是反效果，所以默认不用。
+        self.proxy = proxy or ""
 
     # ---- public API ----
 
@@ -204,12 +209,13 @@ def get_adapter(
     *,
     cookies_file: str = "",
     cookies_dir: str = "",
+    proxy: str = "",
 ) -> PlatformAdapter | None:
     """Get an adapter instance by platform id. Returns None if unknown."""
     cls = _REGISTRY.get(platform)
     if cls is None:
         return None
-    return cls(cookies_file=cookies_file, cookies_dir=cookies_dir)
+    return cls(cookies_file=cookies_file, cookies_dir=cookies_dir, proxy=proxy)
 
 
 def detect_platform(source: str) -> str | None:
@@ -306,6 +312,11 @@ _ADAPTER_MODULES = (
     "weibo",
     "zhihu",
     "tieba",
+    # ⭐ 2026-11-21：小黑盒。hkey v2 签名直连 API，一次请求拿正文/配图/评论，
+    #   不需要 Playwright。见 adapters/xiaoheihe.py 顶部的算法说明。
+    "xiaoheihe",
+    # ⭐ 2026-11-21：Pixiv。国内直连必超时，赖 settings.proxyUrl。
+    "pixiv",
 )
 
 for _mod_name in _ADAPTER_MODULES:

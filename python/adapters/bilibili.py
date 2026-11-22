@@ -16,6 +16,10 @@ from hashlib import md5
 from typing import Any
 from urllib.parse import quote, urlencode
 
+# ⭐ 2026-11-21：专栏正文是 HTML，要转纯文本。用 html 模块做实体反转义——
+#   很多专栏正文里有 &amp; &#39; 这类，不转义会跟着进 text.txt 和总结。
+import html as _html
+
 from . import (
     CommentNode,
     PlatformAdapter,
@@ -76,6 +80,25 @@ def _fetch_wbi_keys(cookies: dict[str, str]) -> tuple[str, str] | None:
 # Adapter
 # ============================================================
 
+def _html_to_text(raw: str) -> str:
+    """专栏正文 HTML → 纯文本。
+
+    只做三件事：剔除 script/style、把块级标签换行、反转义实体。
+    不做完整 HTML 解析——正文是富文本但结构很浅，为了它拖个解析库不划算，
+    而这条链上少一个依赖就少一个环境坑。
+    """
+    if not raw:
+        return ""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", raw)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(?:p|div|li|h[1-6]|blockquote)>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 # 排序映射（同 MediaCrawler）
 _SORT_MAP = {
     0: "totalrank",  # 综合
@@ -93,6 +116,11 @@ class BilibiliAdapter(PlatformAdapter):
         re.compile(r"bilibili\.com/video/(BV[a-zA-Z0-9]+|av\d+)", re.IGNORECASE),
         re.compile(r"^BV[a-zA-Z0-9]+$", re.IGNORECASE),
         re.compile(r"^av\d+$", re.IGNORECASE),
+        # ⭐ 2026-11-21：图文帖。专栏（read/cv）与动态（opus / t.bilibili）走
+        #   _get_article 分支——它们不是视频，走 view API 必输。
+        re.compile(r"bilibili\.com/read/(?:mobile/)?(cv\d+)", re.IGNORECASE),
+        re.compile(r"bilibili\.com/opus/(\d{6,})", re.IGNORECASE),
+        re.compile(r"t\.bilibili\.com/(\d{6,})"),
     ]
     enabled_by_default = True
     needs_login_for_full = False  # 公开数据可不登录
@@ -179,6 +207,12 @@ class BilibiliAdapter(PlatformAdapter):
         *,
         page: int = 0,
     ) -> dict[str, Any]:
+        # ⭐ 2026-11-21：图文帖分流。专栏 cv 与动态 opus 都不是视频，
+        #   走下面的 view API 只会得到 code != 0。
+        if re.search(r"/read/(?:mobile/)?cv\d+", source or "", re.IGNORECASE) \
+                or re.search(r"(?:/opus/|t\.bilibili\.com/)\d{6,}", source or ""):
+            return self._get_article(source)
+
         bvid_or_aid = self._extract_bv_or_av(source)
         if not bvid_or_aid:
             return {"ok": False, "error": "invalid source", "platform": "bilibili"}
@@ -229,6 +263,187 @@ class BilibiliAdapter(PlatformAdapter):
             "aid": info.get("aid", 0),
             "bvid": info.get("bvid", bvid_or_aid),
             "url": f"https://www.bilibili.com/video/{info.get('bvid', bvid_or_aid)}",
+        }
+
+    # ---- 图文帖（专栏 cv / 动态 opus） ----
+
+    def _get_article(self, source: str) -> dict[str, Any]:
+        """图文帖入口。专栏与动态是两套完全不同的接口。"""
+        cookies = self.load_cookies()
+        m = re.search(r"/read/(?:mobile/)?cv(\d+)", source, re.IGNORECASE)
+        if m:
+            return self._get_column(int(m.group(1)), cookies)
+        m = re.search(r"(?:/opus/|t\.bilibili\.com/)(\d{6,})", source)
+        if m:
+            return self._get_dynamic(m.group(1), cookies)
+        return {"ok": False, "platform": "bilibili", "error": "认不出 B 站图文帖 ID"}
+
+    def _get_column(self, cv_id: int, cookies: dict[str, str]) -> dict[str, Any]:
+        """专栏（read/cv）。
+
+        ⚠️ Referer **必须**是具体那篇 cv 页（`/read/cv<id>/`）。实测用站点根
+        `https://www.bilibili.com/` 会稳定回 -509「请求过于频繁」——那不是真的频控，
+        是接口在拿 Referer 判来源，同一秒内换几次都一样结果。
+        """
+        data = http_get_json(
+            "https://api.bilibili.com/x/article/view",
+            params={"id": cv_id},
+            cookies=cookies,
+            headers={"Referer": f"https://www.bilibili.com/read/cv{cv_id}/"},
+            proxy=self.proxy or None,
+        )
+        if not isinstance(data, dict) or data.get("code") != 0:
+            err = (data or {}).get("message") if isinstance(data, dict) else ""
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "item_id": f"cv{cv_id}",
+                "error": f"专栏接口失败（code={(data or {}).get('code') if isinstance(data, dict) else '?'} {err}）",
+            }
+
+        d = data.get("data") or {}
+        author = d.get("author") or {}
+        # 正文是 HTML，压成纯文本——总结和锚点要的是文字，不是标签
+        content = _html_to_text(str(d.get("content") or ""))
+        images = []
+        for idx, url in enumerate(d.get("origin_image_urls") or [], 1):
+            if isinstance(url, str) and url.startswith("http"):
+                images.append({
+                    "url": url.replace("http://", "https://"),
+                    "thumb": url,
+                    "width": 0,
+                    "height": 0,
+                    "caption": f"插图 {idx}",
+                    # B 站图床会校 Referer，不带就是 403
+                    "headers": {"Referer": "https://www.bilibili.com/"},
+                })
+
+        return {
+            "ok": True,
+            "platform": "bilibili",
+            "item_id": f"cv{cv_id}",
+            "bvid": "",
+            "title": str(d.get("title") or f"专栏 cv{cv_id}"),
+            "author": str(author.get("name") or d.get("author_name") or ""),
+            "uploader_id": str(author.get("mid") or ""),
+            "content": content,
+            "description": content[:200],
+            "transcriptText": content,
+            "textKind": "article",
+            "kind": "post",
+            "cover": str(d.get("banner_url") or "").replace("http://", "https://"),
+            "images": images,
+            "imageCount": len(images),
+            "mediaSources": [],
+            "hasVideo": False,
+            "isArticle": True,
+            "tags": [str(t.get("name")) for t in (d.get("tags") or []) if isinstance(t, dict)],
+            "stats": {
+                "view": int(d.get("stats", {}).get("view") or 0) if isinstance(d.get("stats"), dict) else 0,
+                "like": int(d.get("like") or 0),
+                "coin": int(d.get("coin") or 0),
+                "favorite": int(d.get("favorite") or 0),
+            },
+            "pubDate": int(d.get("publish_time") or 0),
+            "url": f"https://www.bilibili.com/read/cv{cv_id}/",
+        }
+
+    def _get_dynamic(self, dyn_id: str, cookies: dict[str, str]) -> dict[str, Any]:
+        """动态（opus / t.bilibili）。
+
+        ⚠️ 这个接口比专栏敏感得多：实测同一 cookie 连续请求几次就开始给空结果
+        （code 0 但 items=[]），属于降级而不是报错。所以采集失败时报的是
+        “可能被风控弱化”，而不是“作品不存在”。
+        """
+        data = http_get_json(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail",
+            params={"id": dyn_id},
+            cookies=cookies,
+            headers={"Referer": f"https://t.bilibili.com/{dyn_id}"},
+            proxy=self.proxy or None,
+        )
+        if not isinstance(data, dict) or data.get("code") != 0:
+            err = (data or {}).get("message") if isinstance(data, dict) else ""
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "item_id": dyn_id,
+                "error": f"动态接口失败（code={(data or {}).get('code') if isinstance(data, dict) else '?'} {err}）",
+            }
+
+        item = (data.get("data") or {}).get("item") or {}
+        if not item:
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "item_id": dyn_id,
+                "error": "动态接口回了空 item（大概是被风控弱化，过一会再试）",
+            }
+
+        mods = item.get("modules") or {}
+        md = mods.get("module_dynamic") or {}
+        major = md.get("major") or {}
+        opus = major.get("opus") or {}
+        author = mods.get("module_author") or {}
+        stat = mods.get("module_stat") or {}
+
+        text = str((opus.get("summary") or {}).get("text")
+                   or (md.get("desc") or {}).get("text") or "").strip()
+        images = []
+        for idx, pic in enumerate(opus.get("pics") or [], 1):
+            if not isinstance(pic, dict):
+                continue
+            url = str(pic.get("url") or "")
+            if not url.startswith("http"):
+                continue
+            images.append({
+                "url": url,
+                "thumb": url,
+                "width": int(pic.get("width") or 0),
+                "height": int(pic.get("height") or 0),
+                "caption": f"图 {idx}",
+                "headers": {"Referer": "https://www.bilibili.com/"},
+            })
+
+        # 专栏类动态（DYNAMIC_TYPE_ARTICLE）正文不在 opus 里，得再拉一次 cv
+        if item.get("type") == "DYNAMIC_TYPE_ARTICLE":
+            rid = str((item.get("basic") or {}).get("rid_str") or "")
+            if rid.isdigit():
+                col = self._get_column(int(rid), cookies)
+                if col.get("ok"):
+                    # 专栏才是完整正文，动态壳只是跳转
+                    col["item_id"] = dyn_id
+                    col["url"] = f"https://www.bilibili.com/opus/{dyn_id}"
+                    col["columnId"] = f"cv{rid}"
+                    return col
+
+        title = str(opus.get("title") or text[:40] or f"B站动态 {dyn_id}")
+        return {
+            "ok": True,
+            "platform": "bilibili",
+            "item_id": dyn_id,
+            "bvid": "",
+            "title": title,
+            "author": str(author.get("name") or ""),
+            "uploader_id": str(author.get("mid") or ""),
+            "content": text,
+            "description": text[:200],
+            "transcriptText": text,
+            "textKind": "article",
+            "kind": "post",
+            "cover": images[0]["url"] if images else "",
+            "images": images,
+            "imageCount": len(images),
+            "mediaSources": [],
+            "hasVideo": False,
+            "dynamicType": str(item.get("type") or ""),
+            "stats": {
+                "like": int((stat.get("like") or {}).get("count") or 0),
+                "comment": int((stat.get("comment") or {}).get("count") or 0),
+                "forward": int((stat.get("forward") or {}).get("count") or 0),
+            },
+            "pubDate": int(author.get("pub_ts") or 0),
+            "url": f"https://www.bilibili.com/opus/{dyn_id}",
         }
 
     # ---- comments ----

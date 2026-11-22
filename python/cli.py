@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform",
         default="auto",
-        choices=["auto", "bilibili", "xhs", "douyin", "kuaishou", "weibo", "zhihu", "tieba"],
+        choices=["auto", "bilibili", "xhs", "douyin", "kuaishou", "weibo", "zhihu", "tieba", "xiaoheihe"],
         help="目标平台（默认 auto 自动检测；可显式指定）",
     )
     parser.add_argument(
@@ -61,6 +61,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-audio",
         action="store_true",
         help="仅采集元数据/评论，不下载音频（B站有效）",
+    )
+    # ⭐ 2026-11-21：出网代理（http:// 或 socks5://）。Pixiv / X / YouTube /
+    #   Instagram 在国内直连必超时，这一项是那几个平台的必要条件。
+    parser.add_argument(
+        "--proxy",
+        default="",
+        help="HTTP/SOCKS5 代理，如 http://127.0.0.1:7890；留空=直连",
+    )
+    # ⭐ 2026-11-21：图文帖落图开关（默认开）。图文帖没图就等于没内容，
+    #   所以默认就要存；真遇到图多又不想等时用 --no-with-images 关掉。
+    parser.add_argument(
+        "--with-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="图文帖把图片存到 <output>/images/（默认开）",
     )
 
     # --- Cookies management (v0.2+) ---
@@ -100,7 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="采集时把原片下下来（当前用于小红书视频笔记，落 output_dir/source_video.mp4）",
     )
-    parser.add_argument(
+    parser.add_argument(
+
         "--list-logins",
         action="store_true",
         help="列出所有已保存 cookies 的平台状态",
