@@ -231,7 +231,7 @@ def _find_cookie_dbs(user_data_dir: Path) -> list[Path]:
 
 
 # ⭐ 2026-11-21：用户完全可能把浏览器数据目录搬到别处。
-#   实测这台机器的 Edge 就在 `D:\EdgeCache\User Data`（进程命令行里带着
+#   实测这台机器的 Edge 就在 `<Edge用户数据目录>`（进程命令行里带着
 #   `--user-data-dir=...`），而 `%LOCALAPPDATA%\Microsoft\Edge\User Data` 是个空壳目录。
 #   任何写死的路径表都盖不住这种情况，所以再补一层：从**运行中的浏览器进程**里
 #   把实际的 --user-data-dir 挖出来。
@@ -239,7 +239,7 @@ _PROCESS_DATA_DIRS_CACHE: list[Path] | None = None
 
 # ⭐ 2026-11-22：发现过的自定义目录要**记住**。
 #   否则会死锁在一步上：Edge 开着时它的库读不了（独占锁）→ 用户关掉 Edge →
-#   进程没了 → `--user-data-dir` 也问不到了 → 反而彻底找不到 `D:\EdgeCache`。
+#   进程没了 → `--user-data-dir` 也问不到了 → 反而彻底找不到 `<Edge用户数据目录>`。
 #   存到本地一份小 JSON，下次直接读。
 _DIRS_MEMO = Path.home() / "AppData" / "Local" / "hanako-intake" / "browser-dirs.json"
 
@@ -274,7 +274,7 @@ _BROWSER_PROCESS_NAMES = (
 def _user_data_dirs_from_processes() -> list[Path]:
     r"""从运行中的浏览器进程命令行里读 `--user-data-dir`。
 
-    ⚠️ 参数形式实测是 `"--user-data-dir=D:\EdgeCache\User Data"` —— **引号包的是整个参数**，
+    ⚠️ 参数形式实测是 `"--user-data-dir=<Edge用户数据目录>"` —— **引号包的是整个参数**，
     不是只包值。用正则 `--user-data-dir="([^"]+)"` 会一个都匹配不到（踩过）。
     所以优先用 psutil：它已经把 cmdline 拆成参数数组，没有引号问题。
 
@@ -347,7 +347,7 @@ def _user_data_dirs_from_processes() -> list[Path]:
 
 
 # 从 --user-data-dir 路径推断它属于哪个浏览器。
-# 为什么需要：实测 Edge 把数据放到了 `D:\EdgeCache\User Data`，如果把这个目录
+# 为什么需要：实测 Edge 把数据放到了 `<Edge用户数据目录>`，如果把这个目录
 # 无差别地赠给每个浏览器分支，Brave/Vivaldi 也会去读 Edge 的库，然后
 # 全部报“被占用”——诊断信息反而把人带沟里。
 _DYNAMIC_DIR_KEYS: dict[str, tuple[str, ...]] = {
@@ -501,7 +501,7 @@ def extract_chrome_cookies(
         return []
 
     # ⭐ 动态发现作为**兜底**放在已知路径之后，不能放前面：
-    #   实测把动态目录放前面时，chrome 分支会先去读 Edge 的库（D:\EdgeCache），
+    #   实测把动态目录放前面时，chrome 分支会先去读 Edge 的库（<Edge用户数据目录>），
     #   而那份库的 AES key 与 Chrome 的 Local State 对不上 → 解密全失败 → 0 条。
     #   而且只能赠给**路径名对得上的那个浏览器**（见 _dynamic_dirs_for）。
     _dynamic = _dynamic_dirs_for(browser)
@@ -529,7 +529,7 @@ def extract_chrome_cookies(
         key = _chrome_get_key(local_state)
 
     # Chrome 运行时 Cookies 库会被**独占锁住**：shutil.copy2 直接 WinError 32
-    #（实测：Edge 开着的时候复制 D:\EdgeCache\User Data\Default\Network\Cookies 必失败）。
+    #（实测：Edge 开着的时候复制 <Edge用户数据目录>\Default\Network\Cookies 必失败）。
     # 所以先试 `mode=ro&nolock=1` 直连原库——只读 + 不申请锁，能绕开浏览器的独占句柄；
     # 不行再退回复制（浏览器已关的情况下复制是最稳的）。
     # ⭐ 2026-11-21：改成遍历**所有 profile**。以前只读 Default，多账号用户

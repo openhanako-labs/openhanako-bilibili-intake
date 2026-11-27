@@ -24,7 +24,7 @@ function sign(hanakoHome, appId) {
   return `${b64}.${sig}`;
 }
 
-const HOMES = ["C:/Users/Administrator/.hanako", "W:/Games/Hanako/.hanako"];
+const HOMES = ["<用户主目录>/.hanako", "<安装根目录>/.hanako"];
 let token = null, tokenHome = null;
 for (const h of HOMES) {
   const t = sign(h, APP_ID);
@@ -102,7 +102,7 @@ const FAKE_PLATFORM = "selfcheck-tmp";
     method: "POST", headers: H, body: JSON.stringify({ platform: FAKE_PLATFORM }),
   });
   const b = await j(r);
-  const gone = !fs.existsSync(`C:/Users/Administrator/.hanako/app-data/bilibili-intake-v2/cookies/${FAKE_PLATFORM}.json`);
+  const gone = !fs.existsSync(`<用户主目录>/.hanako/app-data/bilibili-intake-v2/cookies/${FAKE_PLATFORM}.json`);
   check("cookies-logout 清理成功", r.status === 200 && gone, `deleted=${gone}`);
 }
 

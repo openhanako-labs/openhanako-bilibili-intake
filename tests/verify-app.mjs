@@ -58,7 +58,7 @@ if (r1.reused === true && r1.source === "legacy" && r1.root === legacyRuntimeCan
 } else bad("默认回退逻辑异常", JSON.stringify(r1));
 
 // 显式配置优先且 reused=false。
-const r2 = resolveRuntimeRoot(emptyRoot, ".runtime", undefined, "D:\\my-runtime");
+const r2 = resolveRuntimeRoot(emptyRoot, ".runtime", undefined, "<runtime目录>");
 if (r2.reused === false && r2.source === "config") ok("显式配置的 runtimeRoot 优先，reused=false");
 else bad("配置优先逻辑异常", JSON.stringify(r2));
 

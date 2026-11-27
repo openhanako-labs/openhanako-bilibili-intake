@@ -118,7 +118,7 @@ Access to this API has been restricted. Use --allow-fs-write to manage permissio
 AppHost 进程启动参数（日志/进程表可见）：
 
 ```
-hana-server.exe --permission --allow-fs-read=W:\...\apps\bilibili-intake-v2 ...
+hana-server.exe --permission --allow-fs-read=<app目录> ...
 ```
 
 许可根是**安装目录 + 自己的 app-data**。`plugin-data/` 不在里面。于是：
@@ -522,7 +522,7 @@ rename 'apps\bilibili-intake-v2' -> 'apps\bilibili-intake-v2.update-backup-xxxx'
 **手动 rename（PowerShell 与 cmd move）同样被拒** → 持久文件句柄占用。
 
 **已解决**：月曦夜重启 server 后再走一次安装，**confirm 成功**，
-记录对齐到 0.6.4（installedAt = 2026-09-12T09:16:30Z）。
+记录对齐到 0.6.4（installedAt = 2026-09-12T09:16Z）。
 
 > 重启后再次验证：`rename` **仍被拒** —— 说明句柄持有者不是 server 主进程，
 > 而是 HanaAgent 桌面进程或系统级（索引/杀软）。但**不影响安装流程**：
@@ -622,11 +622,11 @@ SPAWN_PERMISSION_DENIED:
 但 `child-process=False`，功能又断了。看日志找到了**准确的规律**：
 
 ```
-17:20:35  was started (product) + [PERM0002] 警告   → 带 ✓
-17:32:43  was started (product) + [PERM0002] 警告   → 带 ✓
-17:34:40  was started (product) + [PERM0002] 警告   → 带 ✓
-17:40:23  was started (user)    + 无警告           → 不带 ✗  ← 安装后自动启动
-17:41:15  was started (product) + [PERM0002] 警告   → 带 ✓  ← reload
+17:20  was started (product) + [PERM0002] 警告   → 带 ✓
+17:32  was started (product) + [PERM0002] 警告   → 带 ✓
+17:34  was started (product) + [PERM0002] 警告   → 带 ✓
+17:40  was started (user)    + 无警告           → 不带 ✗  ← 安装后自动启动
+17:41  was started (product) + [PERM0002] 警告   → 带 ✓  ← reload
 ```
 
 → **凡是 AppHost 被重建的场景（重启宿主 / 安装 / 更新），都不带 `--allow-child-process`；
@@ -798,7 +798,7 @@ plaintext = plaintext[_CHROME_PLAINTEXT_PREFIX_LEN:]
 
 ```
 不带 cookies   评论数=3   （未登录天花板，page.count=545）
-带 cookies     评论数=50  （SESSDATA 生效，DedeUserID=347410973）
+带 cookies     评论数=50  （SESSDATA 生效，DedeUserID=<账号ID>）
 耗时           6.6s      无需 Playwright 浏览器（yt-dlp 兜底 metadata）
 ```
 
@@ -1130,7 +1130,7 @@ Bug A 修完、Whisper 确实跑完了（audio.m4a 21.3MB、transcriptDevice=cpu
 | 转写字数 | 平台字幕 | **4205 字** |
 | 评论 | — | 50 条一级 |
 
-时间轴（15:04:28 起）：字幕 6s → 音频 2s → **Whisper 2 分 51 秒**（base / CPU / 18 分钟音频）→ 总 2 分 59 秒。
+时间轴（15:04 起）：字幕 6s → 音频 2s → **Whisper 2 分 51 秒**（base / CPU / 18 分钟音频）→ 总 2 分 59 秒。
 
 ### Whisper base 的实际质量
 
@@ -1475,7 +1475,7 @@ v0.6.16：卡片鉴权修通（X-Hana-App-Surface-Session）+ 记录存储，采
 ## 变更记录 v0.6.33 → v0.6.34（2026-09-22）· 知识地图丢掉后台（真跑通了）
 
 **先跑通了**：素材=那份 4/4 回指校验通过的摘要，模型=日日新 `sensenova-6.8-flash-lite`，真生成出一张地图（**4 个阶段 / 约 6 小时**）：
-`W:/Games/Hanako/Work/output/知识地图/2026-09-22-视频总结-app--总结层与记录同步-总结层加固-map.md`
+`<输出目录>/知识地图/2026-09-22-视频总结-app--总结层与记录同步-总结层加固-map.md`
 地图里的四个 clip 就是摘要里的四条要点 —— **素材确实来自“已总结素材”，而不是标题**。
 
 **但跑了 52.9 秒。** 而宿主给工具调用的 RPC 上限是 **30 秒** —— 同步等就必然被掐断（`RPC callback.tools.execute timed out after 30000ms`）。所以：
@@ -1499,7 +1499,7 @@ torch: 2.14.0+cpu   # v1 遗留 venv，装的是 CPU wheel
 ctranslate2: 4.8.2  # 其实自带 CUDA，get_cuda_device_count() == 1
 ```
 
-硬件层面 RTX 3060 + 591.86 驱动正常，`nvidia-smi` 报 CUDA 13.1；`ctranslate2` 的 PyPI wheel 在本机 Windows 上**能探测到 1 张 GPU**（`ctranslate2.get_cuda_device_count() == 1`）。Whisper 之所以没走 GPU，不是硬件问题，也不是驱动问题——是**代码里的探测顺序**问题。
+硬件层面 NVIDIA 独显 + 官方驱动正常，`nvidia-smi` 报 CUDA 正常；`ctranslate2` 的 PyPI wheel 在本机 Windows 上**能探测到 1 张 GPU**（`ctranslate2.get_cuda_device_count() == 1`）。Whisper 之所以没走 GPU，不是硬件问题，也不是驱动问题——是**代码里的探测顺序**问题。
 
 ### 根因
 
@@ -1541,7 +1541,7 @@ ctranslate2: 4.8.2  # 其实自带 CUDA，get_cuda_device_count() == 1
 
 ### 验证
 
-本机（RTX 3060 / 591.86 / CUDA 13.1 驱动 / v1 遗留 venv）：
+本机（NVIDIA 独显 / 官方驱动 / CUDA 正常 / v1 遗留 venv）：
 
 ```python
 from bilibili_pipeline import resolve_whisper_device, ct2_cuda_device_count
@@ -1552,7 +1552,7 @@ resolve_whisper_device("cuda", backend="faster-whisper")  # → "cuda"
 resolve_whisper_device("cpu",  backend="faster-whisper")  # → "cpu"
 ```
 
-对同一段音频，faster-whisper small/float16 在 RTX 3060 上应能比 CPU/int8 快一个数量级；后续长视频采集（比如 1 小时上下的教程）应该从 CPU 的十几分钟量级压到几分钟。
+对同一段音频，faster-whisper small/float16 在 NVIDIA 独显上应能比 CPU/int8 快一个数量级；后续长视频采集（比如 1 小时上下的教程）应该从 CPU 的十几分钟量级压到几分钟。
 
 
 ---
@@ -1638,9 +1638,9 @@ skipped）与 `summaryNote`，卡片按它说话，不再只有一句「未写�
 实测（重载后真实跑）：
 
 ```text
-11:26:25  自动总结完成：…p_1789286333121（要点 8 · 回指 8）   ← 这条链路第一次成功
+11:26  自动总结完成：…p_1789286333121（要点 8 · 回指 8）   ← 这条链路第一次成功
           记录：summaryStatus=ok, summaryPoints=8, summaryGrounded=8
-11:27:39  自动总结未完成：…p_1791084447540（没有可用正文（既没锚点也没 text.txt））
+11:27  自动总结未完成：…p_1791084447540（没有可用正文（既没锚点也没 text.txt））
           记录：summaryStatus=no-text —— 同一个失败，现在有了名字和位置
 ```
 

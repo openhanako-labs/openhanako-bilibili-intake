@@ -85,7 +85,7 @@ export const parameters = {
     },
     output: {
       type: "string",
-      description: "输出目录（可选，默认 W:/Games/Hanako/Work/output/知识地图/）",
+      description: "输出目录（可选，默认 <输出目录>/知识地图/）",
     },
     background: {
       type: "boolean",

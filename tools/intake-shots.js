@@ -19,8 +19,10 @@ import { readTranscriptAnchors } from "../lib/anchors.js";
 import { locateRecord, readRecords } from "../lib/records.js";
 import { getSettings } from "../lib/settings.js";
 import { analyzeFrames, GATES_PROFILE_A, shotValidate } from "../lib/shots/index.js";
-// ⭐ 三格（画面 / 情绪 / 屏幕文字）的填充走宿主视觉模型，不需要 API key。
+// ⭐ 两格（画面 / 情绪）的填充走宿主视觉模型，不需要 API key；屏幕文字交给 OCR。
 import { fillSegments } from "../lib/shots/vision-fill.js";
+// ⭐ 第二刀：定时 OCR 补静态小字（首帧必扫 + 长静止段补采中段帧）。
+import { fillOcr } from "../lib/shots/ocr-fill.js";
 // ⭐ 原片下载：走采集同一条 python 子进程通道（yt-dlp 只在 venv 里）。
 import { downloadVideoForShots } from "../lib/service.js";
 import { toToolError, toToolResult } from "../lib/tool-output.js";
@@ -32,8 +34,9 @@ export const description =
   "产物落在槽位的 shots/ 下（shots.json / frames/ / visual_anchors.json），档 B 还会出运动曲线与联系表。" +
   "用它回答『这片子的画面结构是什么』『第 3 段画面上有什么』。默认档 A（内容档，服务总结锚点）；档 B 是镜头语言档（更贵）。" +
   "需要本地有原片（visual_video.mp4）—— 没有就先在设置里打开「下载原片（帧分析用）」。" +
-  "段里的 desc / emotion / onscreenText 由视觉模型填，本工具只负责切分与抽帧。" +
-  "传 fill:true 就会接着调**宿主**的视觉模型把三格填上（不需要 API key，但每段一次调用）—— 填之前先用 fillLimit 控住花多少。";
+  "段里的 desc / emotion 由视觉模型填、onscreenText 由离线 OCR 补，本工具负责切分与抽帧。" +
+  "传 fill:true 会先跑 OCR 补屏幕文字（首帧必扫 + 长静止段补采中段帧），再用**宿主**视觉模型填 desc/emotion（不需要 API key）—— " +
+  "OCR 没抓到字的段退回旧三格让模型读字，保证 onscreenText 不断源。fillLimit 现在是视觉调用预算（按实际调用次数算）。";
 
 export const parameters = {
   type: "object",
@@ -69,7 +72,15 @@ export const parameters = {
     },
     fillLimit: {
       type: "number",
-      description: "fill 时最多填几段（不传 = 全部）。想先看两眼效果就传 2 或 3。",
+      description: "fill 时的视觉调用预算（按实际调用次数算，不传 = 全部）。想先看两眼效果就传 2 或 3。",
+    },
+    ocrMinScore: {
+      type: "number",
+      description: "OCR 逐行置信度下限（0~1，默认 0.5）。低于它的行丢弃；全丢的段退回视觉模型读字。",
+    },
+    staticMerge: {
+      type: "boolean",
+      description: "视觉填充时长静止段只送首帧、跳过尾帧（默认关）。档 B 有首尾两帧时省一次视觉输入。",
     },
   },
   required: [],
@@ -244,18 +255,39 @@ export async function execute(input = {}, ctx) {
       gateText = `质量门没跑成：${e.message}`;
     }
 
-    // ── 5) 交付（fill 就先填三格） ──
+    // ── 5) 交付（fill：先 OCR 补字，再视觉填画面/情绪） ──
+    // 顺序定死：OCR 先跑，成功的段打 ocrStatus='ok'，视觉填充见此标记只出两格；
+    // OCR 没抓到字的段退回旧三格让模型读字。反过来（先视觉后 OCR）会让
+    // onlyMissing 把 onscreenText 当成已填，OCR 就被跳过了。
     let fillText = "";
+    let ocrText = "";
     if (input.fill) {
+      const ocr = await fillOcr({
+        anchorsPath: res.anchorsPath,
+        videoPath,
+        ctx,
+        settings,
+        minScore: Number(input.ocrMinScore) > 0 ? Number(input.ocrMinScore) : 0.5,
+        signal: null,
+      });
+      ocrText = ocr.ok
+        ? `OCR 补字：${ocr.ocrd}/${ocr.total} 段抓到文字${ocr.empty ? `，${ocr.empty} 段无字` : ""}${ocr.midFrames ? `，补采中段 ${ocr.midFrames} 帧` : ""}｜阈值 ${ocr.minScore}`
+          + (ocr.errors?.length ? `\n   · ${ocr.errors.join("\n   · ")}` : "")
+        : `OCR 补字没跑成：${ocr.error}（所有段退回视觉模型读字，onscreenText 不断源）`;
+
       const f = await fillSegments({
         anchorsPath: res.anchorsPath,
         subtitleSegments,
         limit: Number(input.fillLimit) > 0 ? Number(input.fillLimit) : 0,
+        staticMerge: input.staticMerge === true,
+        ocrFillReport: ocr.ok ? { ocrd: ocr.ocrd, fallback: ocr.fallback } : null,
       });
+      const tu = f.tokenUsage || { prompt: 0, completion: 0, total: 0 };
       fillText = f.ok
-        ? `三格填充：${f.filled} 段已填${f.failed ? `，${f.failed} 段失败` : ""}${f.skipped ? `，${f.skipped} 段跳过（已有内容）` : ""}｜模型 ${f.provider}/${f.model}`
+        ? `视觉填充：${f.filled} 段已填${f.failed ? `，${f.failed} 段失败` : ""}${f.skipped ? `，${f.skipped} 段跳过（已有内容）` : ""}｜模型 ${f.provider}/${f.model}`
+          + `${f.ocrFallback ? `｜回退读字 ${f.ocrFallback} 段` : ""}｜视觉调用 ${f.calls} 次｜token ${tu.total || (tu.prompt + tu.completion)}`
           + (f.errors?.length ? `\n   · ${f.errors.join("\n   · ")}` : "")
-        : `三格填充没跑成：${f.error}`;
+        : `视觉填充没跑成：${f.error}`;
     }
     const seg = res.doc.contentSegments || res.doc.shots.map((s) => ({ start: s.start, end: s.end, seconds: s.seconds }));
     const lines = [
@@ -269,13 +301,14 @@ export async function execute(input = {}, ctx) {
       seg.length > 12 ? `  …… 还有 ${seg.length - 12} 段（见 shots.json）` : "",
       "",
       `产物：${outDir}`,
-      `  shots.json（切段底稿）｜frames/（${frames.length} 张）｜visual_anchors.json（${seg.length} 段，desc/emotion/onscreenText 待视觉模型填）`,
+      `  shots.json（切段底稿）｜frames/（${frames.length} 张）｜visual_anchors.json（${seg.length} 段，desc/emotion 待视觉填、onscreenText 待 OCR 补）`,
       res.reportPath ? "  report.html（单文件报告，卡片可预览）" : "",
       sheets ? `  sheets/（联系表 ${sheets.a.made.length} 张）｜track.json（运动曲线）` : "",
       "",
       gateText,
       "",
-      fillText || "下一步：三格描述（画面 / 情绪 / 屏幕文字）还是空的。传 fill:true 就调宿主的视觉模型填上（不需要 API key）—— 先用 fillLimit 试两段。",
+      ...(ocrText ? [ocrText, ""] : []),
+      fillText || "下一步：画面/情绪还是空的、屏幕文字还没补。传 fill:true 就跑 OCR 补字 + 宿主视觉模型填画面（不需要 API key）—— 先用 fillLimit 试两段。",
     ].filter((x) => x !== "");
 
     return toToolResult({

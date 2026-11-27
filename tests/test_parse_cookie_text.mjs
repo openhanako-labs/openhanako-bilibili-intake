@@ -1,7 +1,7 @@
 // parseCookieText 逻辑单测：从 intake.js 提取函数源码，eval 后跑用例
 import fs from "node:fs";
 
-const src = fs.readFileSync("C:\\Users\\Administrator\\.hanako\\apps\\bilibili-intake-v2\\http\\intake.js", "utf-8");
+const src = fs.readFileSync(new URL("../http/intake.js", import.meta.url), "utf-8");
 const start = src.indexOf("const normalizeEntry");
 const end = src.indexOf("app.post(\"/intake/login/import-cookies\"");
 if (start < 0 || end < 0 || end <= start) { console.error("FAIL: 没截取到函数源码"); process.exit(1); }

@@ -21,7 +21,7 @@ function sign(hanakoHome, appId) {
 }
 
 let token = null;
-for (const h of ["C:/Users/Administrator/.hanako", "W:/Games/Hanako/.hanako"]) {
+for (const h of ["<用户主目录>/.hanako", "<安装根目录>/.hanako"]) {
   const t = sign(h, APP_ID);
   const r = await fetch(`${BASE}${PREFIX}/intake/health`, { headers: { "X-Hana-App-Surface-Session": t } });
   if (r.ok) { token = t; break; }

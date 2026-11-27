@@ -24,7 +24,7 @@ from .prompts import (
 from .validator import collect_bvids, sanitize_graph
 
 # 默认输出目录
-OUTPUT_DIR = os.environ.get("KNOWLEDGE_MAP_OUTPUT", "W:/Games/Hanako/Work/output/知识地图/")
+OUTPUT_DIR = os.environ.get("KNOWLEDGE_MAP_OUTPUT", "<输出目录>/知识地图/")
 
 
 # =============================================================================

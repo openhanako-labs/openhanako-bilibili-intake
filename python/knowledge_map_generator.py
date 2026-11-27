@@ -65,7 +65,7 @@ async def main():
         # 保存 Markdown
         output_dir = args.output or os.environ.get(
             "KNOWLEDGE_MAP_OUTPUT",
-            "W:/Games/Hanako/Work/output/知识地图/"
+            "<输出目录>/知识地图/"
         )
         filepath = save_markdown(map_data, output_dir)
 

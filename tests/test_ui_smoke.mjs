@@ -1,7 +1,7 @@
 // 顶层 stub 冒烟：模拟最小 DOM 跑完 intake-script.js 全部顶层代码，暴露运行时错误
 import fs from "node:fs";
 
-const src = fs.readFileSync("C:\\Users\\Administrator\\.hanako\\apps\\bilibili-intake-v2\\ui\\intake-script.js", "utf-8");
+const src = fs.readFileSync(new URL("../ui/intake-script.js", import.meta.url), "utf-8");
 
 const elStub = () => ({
   addEventListener() {}, removeEventListener() {},

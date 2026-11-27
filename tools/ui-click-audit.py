@@ -7,7 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 
-HTML = Path(r"C:\Users\Administrator\.hanako\apps\bilibili-intake-v2\ui\intake.html")
+HTML = Path(__file__).resolve().parent.parent / "ui" / "intake.html"
 
 PROBE = """
 () => {

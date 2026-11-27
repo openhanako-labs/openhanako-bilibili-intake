@@ -29,7 +29,7 @@ function has(text, needle) { return text.includes(needle); }
 
 const base = {
   ok: true, platform: "bilibili", title: "测试视频", uploader: "UP主", duration: 35.9,
-  transcriptSource: "none", outputDir: "W:\\captures\\x", recordId: "rec_bilibili_TEST",
+  transcriptSource: "none", outputDir: "<captures目录>", recordId: "rec_bilibili_TEST",
 };
 
 // ① noAudio + 无字幕：正文缺席必须当场说清，评论要报数，总结跳过要有原因
@@ -66,7 +66,7 @@ const base = {
 // ③ 前台采集、总结成功：点数与回指数必须在
 {
   const text = formatAgentPayload({
-    ...base, transcriptSource: "platform_subtitle", transcriptTextPath: "W:\\captures\\x\\text.txt",
+    ...base, transcriptSource: "platform_subtitle", transcriptTextPath: "<captures目录>\\text.txt",
     comments: [{ rpid: 1, replies: [] }],
     autoSummary: { ok: true, counts: { total: 8, grounded: 8, ungrounded: 0 }, brief: "一句话摘要示例。" },
   });
@@ -77,7 +77,7 @@ const base = {
 // ④ 后台采集、总结排队：要能看到任务号，且不能说成完成
 {
   const text = formatAgentPayload({
-    ...base, transcriptSource: "whisper", transcriptTextPath: "W:\\captures\\x\\text.txt",
+    ...base, transcriptSource: "whisper", transcriptTextPath: "<captures目录>\\text.txt",
     autoSummary: { pending: true, taskId: "app:bilibili-intake-v2:abc123" },
   });
   check("排队态带任务号", has(text, "任务 app:bilibili-intake-v2:abc123"));
@@ -87,7 +87,7 @@ const base = {
 // ⑤ 总结失败：原因与重试入口都要有
 {
   const text = formatAgentPayload({
-    ...base, transcriptSource: "whisper", transcriptTextPath: "W:\\captures\\x\\text.txt",
+    ...base, transcriptSource: "whisper", transcriptTextPath: "<captures目录>\\text.txt",
     autoSummary: { ok: false, error: "模型 180s 内没有响应" },
   });
   check("失败态报原因", has(text, "自动总结未完成: 模型 180s 内没有响应"));

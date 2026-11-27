@@ -30,3 +30,7 @@ Pillow
 #   而且它是**静默**失败（ImportError 被 except 吃掉），表现就是“明明登录了却取不到”。
 #   实测：App 的 venv 里没这个包，命令行用系统 python 却有，两边行为不一致。
 cryptography
+# ⭐ 2026-11-27 第二刀（定时 OCR 补静态小字）：离线识别屏幕文字，无需 Token。
+#   lib/shots/ocr-fill.js 通过 venv 子进程调 python/ocr-image.py；
+#   实测 venv 缺此包（只有系统 Python 3.12 有），必须在这里声明并装进 venv。
+rapidocr-onnxruntime

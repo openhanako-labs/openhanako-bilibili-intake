@@ -64,7 +64,11 @@ Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -CompressionLevel Optimal
 Remove-Item -LiteralPath $stage -Recurse -Force
 $zipItem = Get-Item -LiteralPath $zipPath
-$sha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+# ⚠️ 2026-11-22：必须 .ToLower()。Get-FileHash 返回的是大写十六进制，
+#   而市场校验器要求小写（错误原文：
+#   “entry archive.sha256 must be 64 lowercase hexadecimal characters”）。
+#   大小写对哈希值是同一个含义，但对校验器是两个不同的字符串——它只认小写。
+$sha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
 Write-Host ("zip: {0}  {1} KB  sha256 {2}…" -f $zipItem.Name, [int]($zipItem.Length / 1KB), $sha.Substring(0, 16))
 
 # ── 3. entry.json ─────────────────────────────────────────────────
